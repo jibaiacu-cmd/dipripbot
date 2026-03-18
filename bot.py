@@ -741,6 +741,10 @@ def format_alert(s: dict) -> str:
     else:
         helius_block = ""
 
+    vol24_t = f"${s['vh24']/1e6:.1f}M" if s['vh24'] >= 1e6 else f"${s['vh24']/1000:.0f}K"
+    c1_t    = f"${s['open_c1']:.8f}" if s['open_c1'] > 0 else "N/A"
+    age_t   = f"{s['age_h']:.1f}h" if s['age_h'] > 0 else "N/A"
+
     # LunarCrush — tampil kalau ada data, skip kalau kosong
     if s.get("social_ok"):
         trend_arrow = "📈" if s["mention_trend"] >= 0 else "📉"
@@ -754,8 +758,6 @@ def format_alert(s: dict) -> str:
         )
     else:
         social_block = ""  # Kosong = tidak ditampilkan sama sekali
-    c1_t    = f"${s['open_c1']:.8f}" if s['open_c1'] > 0 else "N/A"
-    age_t   = f"{s['age_h']:.1f}h" if s['age_h'] > 0 else "N/A"
 
     return f"""
 🚨 <b>DIP &amp; RIP ALERT v9.3!</b>
