@@ -7,9 +7,9 @@ from datetime import datetime
 BOT_TOKEN      = os.environ.get("BOT_TOKEN",      "YOUR_BOT_TOKEN_HERE")
 CHAT_ID        = os.environ.get("CHAT_ID",        "YOUR_CHAT_ID_HERE")
 LUNARCRUSH_KEY = os.environ.get("LUNARCRUSH_KEY", "")
-HELIUS_KEY     = os.environ.get("HELIUS_KEY",     "")  # 🆕 v9.0
+HELIUS_KEY     = os.environ.get("HELIUS_KEY",     "")  # 🆕 v9.1
 
-# ── STRATEGY PARAMETERS v9.0 ────────────────────────────
+# ── STRATEGY PARAMETERS v9.1 ────────────────────────────
 
 # 🟣 TIER 1 — EARLY ENTRY (Lucia pattern)
 T1_MIN_MCAP      = 50000    # MCAP minimal $50K
@@ -941,7 +941,7 @@ def main():
     helius_status = "✅ Aktif" if HELIUS_KEY else "⚠️ Belum ada key"
     lunar_status  = "✅ Aktif" if LUNARCRUSH_KEY else "⚠️ Belum ada key"
     print("=" * 60)
-    print("  DIP & RIP BOT v9.0 — EARLY DETECTION + SAFETY FIRST")
+    print("  DIP & RIP BOT v9.1 — EARLY DETECTION + SAFETY FIRST")
     print("=" * 60)
     print(f"  Helius API  : {helius_status}")
     print(f"  LunarCrush : {lunar_status}")
