@@ -861,7 +861,7 @@ def format_alert(s: dict) -> str:
     vol24_text = f"${s['vol_h24']/1000000:.1f}M" if s['vol_h24'] >= 1e6 else f"${s['vol_h24']/1000:.0f}K"
 
     return f"""
-🚨 <b>DIP &amp; RIP ALERT v9.0!</b>
+🚨 <b>DIP &amp; RIP ALERT v9.1!</b>
 
 {emoji} <b>{tier_label}</b>
 📍 {tier_desc}
