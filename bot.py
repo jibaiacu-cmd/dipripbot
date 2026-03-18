@@ -38,6 +38,15 @@ MAX_SNIPER_PCT    = 5.0     # Sniper hold max 5%
 MAX_TOP10_PCT     = 25.0    # Top 10 holder max 25%
 MIN_LP_BURNED_PCT = 50.0    # LP Burned minimal 50%
 
+# 🆕 v9.1 Hard Reject Filters (Dislike lesson)
+# Token dengan kondisi ini langsung REJECT tanpa alert
+MIN_TOKEN_AGE_T1  = 1.0     # T1: Token minimal 1 jam
+MIN_TOKEN_AGE_T2  = 0.5     # T2: Token minimal 30 menit
+MIN_LP_BURNED_T1  = 50.0    # T1: LP Burned minimal 50%
+MIN_LP_BURNED_T2  = 20.0    # T2: LP Burned minimal 20%
+MIN_HOLDERS_T1    = 100     # T1: Minimal 100 holders
+MIN_HOLDERS_T2    = 50      # T2: Minimal 50 holders
+
 # Pattern parameters
 MIN_PUMP_PCT           = 150
 MIN_DIP_PCT            = 20   # Lebih longgar untuk early
@@ -51,6 +60,14 @@ SCAN_INTERVAL_SEC   = 30
 ALERT_COOLDOWN_SEC  = 300
 
 # ── CHANGELOG ────────────────────────────────────────────
+# v9.1 — Hard Reject Filters (18 Mar 2026):
+#   Belajar dari Dislike token:
+#   + Hard reject: age <1h untuk T1
+#   + Hard reject: LP Burned <50% untuk T1
+#   + Hard reject: holders <100 untuk T1
+#   + Hard reject: age <30m untuk T2
+#   + Hard reject: LP Burned <20% untuk T2
+#
 # v9.0 — Early Detection System (18 Mar 2026):
 #   Belajar dari Lucia:
 #   - Entry di MCAP $200K jauh lebih baik
@@ -643,6 +660,36 @@ def analyze_pair(pair: dict):
             print(f"[REJECT SAFETY] {token_symbol} {s_warn[0]}")
             return None
 
+        # 🆕 v9.1 HARD REJECT FILTERS
+        if gmgn_data.get("available"):
+            age_h       = gmgn_data.get("age_hours", 0)
+            lp_burned   = gmgn_data.get("lp_burned_pct", 0)
+            holders     = gmgn_data.get("holder_count", 0)
+
+            if tier == "T1":
+                # T1 paling ketat — harus sudah proven minimal
+                if age_h < MIN_TOKEN_AGE_T1:
+                    print(f"[REJECT v9.1] {token_symbol} — T1 age {age_h:.1f}h < {MIN_TOKEN_AGE_T1}h")
+                    return None
+                if lp_burned < MIN_LP_BURNED_T1:
+                    print(f"[REJECT v9.1] {token_symbol} — T1 LP {lp_burned:.0f}% < {MIN_LP_BURNED_T1}%")
+                    return None
+                if holders < MIN_HOLDERS_T1:
+                    print(f"[REJECT v9.1] {token_symbol} — T1 holders {holders} < {MIN_HOLDERS_T1}")
+                    return None
+
+            elif tier == "T2":
+                # T2 lebih longgar tapi tetap ada minimum
+                if age_h < MIN_TOKEN_AGE_T2:
+                    print(f"[REJECT v9.1] {token_symbol} — T2 age {age_h:.1f}h < {MIN_TOKEN_AGE_T2}h")
+                    return None
+                if lp_burned < MIN_LP_BURNED_T2:
+                    print(f"[REJECT v9.1] {token_symbol} — T2 LP {lp_burned:.0f}% < {MIN_LP_BURNED_T2}%")
+                    return None
+                if holders < MIN_HOLDERS_T2:
+                    print(f"[REJECT v9.1] {token_symbol} — T2 holders {holders} < {MIN_HOLDERS_T2}")
+                    return None
+
         # Untuk T1, safety sangat ketat
         critical_safety = [w for w in s_warn if w.startswith("🔴")]
         if tier == "T1" and len(critical_safety) >= 1:
@@ -904,17 +951,14 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.0 aktif!</b>\n\n"
-        "🆕 Early Detection + Safety First:\n\n"
-        "🟣 <b>T1 — Early Entry</b> (MCAP $50K-$300K)\n"
-        "   Potensi 5-10x | Safety ketat\n\n"
-        "🟢 <b>T2 — Normal Entry</b> (MCAP $300K-$1M)\n"
-        "   Potensi 2-5x | Balanced\n\n"
-        "🔵 <b>T3 — Late/Safe</b> (MCAP >$1M)\n"
-        "   Potensi 1-3x | Paling aman\n\n"
-        "🔒 <b>Safety Score di setiap alert:</b>\n"
-        "   LP Burned | Bundle % | Dev % | Snipers\n\n"
-        f"📊 Helius: {helius_status}\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.1 aktif!</b>\n\n"
+        "🆕 Hard Reject Filters:\n"
+        f"⏱ T1: Min age <b>{MIN_TOKEN_AGE_T1}h</b> | LP <b>{MIN_LP_BURNED_T1:.0f}%</b> | Holders <b>{MIN_HOLDERS_T1}</b>\n"
+        f"⏱ T2: Min age <b>{MIN_TOKEN_AGE_T2}h</b> | LP <b>{MIN_LP_BURNED_T2:.0f}%</b> | Holders <b>{MIN_HOLDERS_T2}</b>\n\n"
+        "📚 Belajar dari Dislike token:\n"
+        "✅ Token 0h + LP 0% = auto REJECT!\n"
+        "✅ Holders 0 = auto REJECT!\n\n"
+        "🟣 T1 Early | 🟢 T2 Normal | 🔵 T3 Late\n"
         "🚨 Scan setiap 30 detik!"
     )
     while True:
