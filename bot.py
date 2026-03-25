@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v9.8 — NO MORE BAD ALERTS
+#   DIP & RIP BOT v9.9 — NO MORE BAD ALERTS
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
 #
 #   CHANGELOG v9.8 (25 Mar 2026):
@@ -29,6 +29,27 @@ from pathlib import Path
 #   [v9.8-8] Top10 grey zone 30–40% diberi penalti -1 score.
 #   [v9.8-9] Smart Money "Netral" disembunyikan saat GMGN tidak tersedia
 #            karena nilainya selalu 0/0 = tidak informatif sama sekali.
+#
+#   CHANGELOG v9.9 (25 Mar 2026):
+#   [v9.9-1] Cache cleanup — gmgn_cache, helius_cache, rugcheck_cache,
+#            social_cache tumbuh tanpa batas → memory leak lambat.
+#            Fix: bersihkan entry expired setiap scan_once().
+#   [v9.9-2] age_hours bisa negatif jika clock drift/bad timestamp.
+#            Fix: clamp ke max(0, age_hours).
+#   [v9.9-3] get_open_c1() tidak handle price=0 → bisa simpan C1=$0.
+#            Fix: return 0 early jika price <= 0.
+#   [v9.9-4] T0 dip_line di format_alert menampilkan "Momentum h6"
+#            tapi pump_pct = max(h6, h1). Jika h1 > h6, label salah.
+#            Fix: gunakan label dinamis berdasarkan sumber pump_pct.
+#   [v9.9-5] check_safety() silent reject (GMGN tidak tersedia) tanpa
+#            log → debugging sulit. Fix: tambah print log penolakan.
+#   [v9.9-6] Redundant critical-warning check — dilakukan di
+#            check_safety() DAN analyze_pair(). Fix: hapus duplikat
+#            di analyze_pair() karena check_safety() sudah return False.
+#   [v9.9-7] SCAN_MAX_TOKENS configurable — sebelumnya hardcode 40.
+#   [v9.9-8] format_alert() T0 pump_pct label mismatch — fixed.
+#   [v9.9-9] get_pair() guard: pastikan pairs list tidak kosong
+#            dan setiap pair punya volume dict sebelum sort.
 #
 #   CARRIED OVER FROM v9.6 (9 fixes + 5 post-review bugfixes):
 #   Semua fix v9.6 tetap aktif, tidak ada yang diregresi.
@@ -191,6 +212,7 @@ RUGCHECK_MAX_RISKS         = 2
 RUGCHECK_HARD_REJECT_RISKS = 5    # [FIX #8] konstanta eksplisit
 SCAN_INTERVAL_SEC          = 30
 ALERT_COOLDOWN_SEC         = 300
+SCAN_MAX_TOKENS            = 40   # [v9.9-7] jumlah token per scan cycle
 
 # ── T0 ENHANCEMENT PARAMETERS ───────────────────────────
 # [ENH-A] Liq/MCAP Ratio — pool sehat = susah dimanipulasi
@@ -211,6 +233,18 @@ helius_cache   = {}
 rugcheck_cache = {}
 social_cache   = {}
 CACHE_SEC      = 300
+
+# [v9.9-1] Bersihkan cache yang expired agar tidak memory leak
+def cleanup_caches():
+    now = time.time()
+    removed = 0
+    for cache in [gmgn_cache, helius_cache, rugcheck_cache, social_cache]:
+        expired_keys = [k for k, (ct, _) in cache.items() if now - ct >= CACHE_SEC * 3]
+        for k in expired_keys:
+            del cache[k]
+            removed += 1
+    if removed > 0:
+        print(f"[CACHE] Cleaned {removed} expired entries")
 
 # ── TELEGRAM ─────────────────────────────────────────────
 def send_telegram(message: str) -> bool:
@@ -290,9 +324,12 @@ def get_pair(token_address: str) -> dict | None:
     try:
         r = api_get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=15)
         if not r or r.status_code != 200: return None
-        pairs = r.json().get("pairs", [])
+        pairs = r.json().get("pairs") or []
         if not pairs: return None
-        return sorted(pairs, key=lambda x: x.get("volume", {}).get("h24", 0), reverse=True)[0]
+        # [v9.9-9] Guard: pastikan volume dict ada sebelum sort
+        return sorted(pairs,
+                      key=lambda x: float((x.get("volume") or {}).get("h24", 0) or 0),
+                      reverse=True)[0]
     except: return None
 
 # ── GMGN ─────────────────────────────────────────────────
@@ -318,7 +355,8 @@ def get_gmgn(token_address: str) -> dict:
             token = r.json().get("data", {}).get("token", {})
             if token:
                 created_at = token.get("open_timestamp", 0)
-                age_hours  = (time.time() - created_at) / 3600 if created_at else 0
+                # [v9.9-2] clamp ke 0 — bisa negatif jika clock drift atau bad timestamp
+                age_hours  = max(0, (time.time() - created_at) / 3600) if created_at else 0
 
                 # Guard: clamp nilai ke 0–100 untuk deteksi anomali API
                 raw_lp  = float(token.get("burn_ratio", 0) or 0) * 100
@@ -493,7 +531,14 @@ def get_open_c1(token_address: str, price: float) -> float:
     Juga update tracked high jika harga sekarang lebih tinggi.
     [FIX #4] Simpan sebagai dict {price, high, ts} bukan float.
     [FIX #5] Hapus save_state() dari sini — diurus scan_once().
+    [v9.9-3] Guard: jika price <= 0, jangan simpan C1 = $0.
     """
+    if price <= 0:
+        entry = price_tracker.get(token_address)
+        if entry and isinstance(entry, dict):
+            return entry["price"]
+        return 0.0
+
     entry = price_tracker.get(token_address)
     if entry is None:
         price_tracker[token_address] = {"price": price, "high": price, "ts": time.time()}
@@ -586,13 +631,17 @@ def check_safety(gmgn: dict, helius: dict, rugcheck: dict, tier: str) -> tuple:
     # [v9.8-2] T1/T2/T3 wajib GMGN — tanpa LP/Bundle/Dev tidak ada
     # dasar keputusan. Alert dengan semua field N/A = alert berbahaya.
     # [v9.8-3] T0 wajib minimal Rugcheck tersedia + score >= 60.
+    # [v9.9-5] Log penolakan agar debugging lebih mudah
     if tier in ["T1", "T2", "T3"]:
         if not gmgn.get("available"):
+            print(f"[SAFETY] {tier} ditolak — GMGN tidak tersedia")
             return False, 0, [], [], ""
     elif tier == "T0":
         if not gmgn.get("available") and not rugcheck.get("available"):
+            print(f"[SAFETY] T0 ditolak — GMGN dan Rugcheck tidak tersedia")
             return False, 0, [], [], ""
         if rugcheck.get("available") and rugcheck.get("score", 0) < 60:
+            print(f"[SAFETY] T0 ditolak — Rugcheck score {rugcheck.get('score', 0)} < 60")
             return False, 0, [], [], ""
 
     # Per-tier threshold checks
@@ -1026,8 +1075,8 @@ def analyze_pair(pair: dict) -> dict | None:
         other_warns = [w for w in all_warnings if not w.startswith("🔴")]
         all_warnings_sorted = (red_warns + other_warns)[:4]
 
-        critical = [w for w in all_warnings if w.startswith("🔴")]
-        if len(critical) >= 2: return None
+        # [v9.9-6] Redundant critical check dihapus — sudah dilakukan di check_safety()
+        # yang me-return False jika len(critical) >= 2. Tidak perlu cek ulang di sini.
 
         # Grade per tier — [v9.8-4] Grade C dihapus.
         # Bot bilang "lemah" tapi tetap kirim entry zone = kontradiktif.
@@ -1184,13 +1233,17 @@ def format_alert(s: dict) -> str:
     c1_t     = f"${s['open_c1']:.8f}"   if s['open_c1'] > 0 else "N/A"
     age_t    = f"{s['age_h']:.1f}h"     if s['age_h']  > 0 else "N/A"
     mode_lbl = "🔥 PRE-PUMP MODE" if s["tier"] == "T0" else "📉 DIP &amp; RIP MODE"
-    dip_line = (f"📈 Momentum h6: <b>+{s['pump_pct']}%</b>" if s["tier"] == "T0"
-                else f"📉 Dip dari high: <b>-{s['dip_pct']}%</b>")
+    # [v9.9-4] T0: pump_pct = max(h6, h1) → label harus dinamis
+    if s["tier"] == "T0":
+        pump_src = "h6" if s["h6"] >= s["h1"] else "h1"
+        dip_line = f"📈 Momentum {pump_src}: <b>+{s['pump_pct']}%</b>"
+    else:
+        dip_line = f"📉 Dip dari high: <b>-{s['dip_pct']}%</b>"
     footer   = ("⛔ T0 ULTRA EARLY — Posisi SANGAT KECIL! Konfirmasi manual dulu!"
                 if s["tier"] == "T0" else "⚡ Konfirmasi LP Burned & Bundle di Axiom!")
 
     return f"""
-🚨 <b>DIP &amp; RIP ALERT v9.8!</b> {mode_lbl}
+🚨 <b>DIP &amp; RIP ALERT v9.9!</b> {mode_lbl}
 
 {temoji} <b>{tlabel}</b>
 📍 {tdesc}
@@ -1239,6 +1292,7 @@ def format_alert(s: dict) -> str:
 # ── MAIN LOOP ─────────────────────────────────────────────
 def scan_once():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning...")
+    cleanup_caches()   # [v9.9-1] Bersihkan cache expired setiap scan cycle
     trending = get_trending_tokens()
     new_tok  = get_new_tokens()
     all_addr = set()
@@ -1250,7 +1304,7 @@ def scan_once():
     t0 = t1 = t2 = t3 = 0
     state_dirty = False   # [BUG-L FIX] Track apakah state perlu disimpan
 
-    for addr in list(all_addr)[:40]:
+    for addr in list(all_addr)[:SCAN_MAX_TOKENS]:
         if time.time() - alerted_tokens.get(addr, 0) < ALERT_COOLDOWN_SEC: continue
         pair   = get_pair(addr)
         if not pair: continue
@@ -1277,7 +1331,7 @@ def scan_once():
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v9.8 — NO MORE BAD ALERTS")
+    print("  DIP & RIP BOT v9.9 — NO MORE BAD ALERTS")
     print("  Core: Token Aman + Dump Sehat + Second Pump")
     print("  RULE: Tidak ada alert tanpa data pendukung wajib")
     print("=" * 60)
@@ -1291,19 +1345,18 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.8 aktif!</b>\n\n"
-        "🛡️ <b>v9.8 — No More Bad Alerts:</b>\n\n"
-        "🔴 <b>Gate baru (alert ditolak jika):</b>\n"
-        "   ✅ Hub &amp; Spoke → hard reject di semua jalur\n"
-        "   ✅ T1/T2/T3 tanpa GMGN → ditolak\n"
-        "   ✅ T0 tanpa Rugcheck ≥60 → ditolak\n"
-        "   ✅ Grade C → tidak lagi di-alert\n\n"
-        "🔧 <b>Fix logika &amp; display:</b>\n"
-        "   ✅ C1 konsisten — tidak ada pesan bertentangan\n"
-        "   ✅ age_h fallback aktif sebelum safety check\n"
-        "   ✅ Holders N/A bukan 0 saat GMGN tidak ada\n"
-        "   ✅ Top10 30–40% dapat penalti score\n"
-        "   ✅ Smart Money disembunyikan saat data N/A\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.9 aktif!</b>\n\n"
+        "🛡️ <b>v9.9 — Stability &amp; Cleanup:</b>\n\n"
+        "🔧 <b>Fix v9.9:</b>\n"
+        "   ✅ Cache cleanup — memory leak dicegah\n"
+        "   ✅ age_hours clamp negatif\n"
+        "   ✅ C1 guard price=0\n"
+        "   ✅ T0 label momentum dinamis (h6/h1)\n"
+        "   ✅ Silent reject logging untuk debugging\n"
+        "   ✅ Redundant critical check dihapus\n"
+        "   ✅ SCAN_MAX_TOKENS configurable\n"
+        "   ✅ get_pair() safe sort\n\n"
+        "🛡️ <b>Semua gate v9.8 tetap aktif</b>\n"
         "🚨 Scan setiap 30 detik!"
     )
 
