@@ -115,7 +115,7 @@ price_tracker  = _state.get("price_tracker", {})
 
 # ── TIER PARAMETERS ─────────────────────────────────────
 # T0 — PRE-PUMP: MCAP $30K-$100K, ultra early
-T0_MIN_MCAP      = 30_000
+T0_MIN_MCAP      = 25_000
 T0_MAX_MCAP      = 100_000
 T0_MIN_LIQUIDITY = 8_000
 T0_MIN_VOL_1H    = 5_000
@@ -164,10 +164,23 @@ MIN_HOLDERS_T2          = 50
 HELIUS_MAX_TOP10        = 30.0
 MAX_CANDLE_DROP         = 25
 
-RUGCHECK_MAX_RISKS       = 2
-RUGCHECK_HARD_REJECT_RISKS = 5   # [FIX #8] konstanta eksplisit
-SCAN_INTERVAL_SEC        = 30
-ALERT_COOLDOWN_SEC       = 300
+RUGCHECK_MAX_RISKS         = 2
+RUGCHECK_HARD_REJECT_RISKS = 5    # [FIX #8] konstanta eksplisit
+SCAN_INTERVAL_SEC          = 30
+ALERT_COOLDOWN_SEC         = 300
+
+# ── T0 ENHANCEMENT PARAMETERS ───────────────────────────
+# [ENH-A] Liq/MCAP Ratio — pool sehat = susah dimanipulasi
+LIQ_MCAP_RATIO_MIN_T0  = 0.15   # liq minimal 15% dari mcap
+LIQ_MCAP_RATIO_GOOD_T0 = 0.30   # >= 30% = bonus score
+
+# [ENH-B] Volume spike tier tinggi
+VOL_SPIKE_EXTREME = 10.0   # 10x avg5m → bonus extra
+VOL_SPIKE_STRONG  = 5.0    # 5x → naik bobot dari +5 ke +6
+
+# [ENH-C] TX acceleration — jumlah tx per menit naik tiba-tiba
+TX_ACCEL_STRONG  = 3.0     # tx m5 >= 3x rata-rata h1
+TX_ACCEL_EXTREME = 6.0     # tx m5 >= 6x rata-rata h1
 
 # ── CACHE ────────────────────────────────────────────────
 gmgn_cache     = {}
@@ -334,7 +347,14 @@ def get_rugcheck(token_address: str) -> dict:
             data        = r.json()
             risks       = data.get("risks", []) or []
             risk_names  = [risk.get("name", "") for risk in risks]
-            risk_level  = data.get("score", 0) or 0
+            # [BUG-CRIT-1 FIX] Rugcheck score bisa 0–1000 bukan 0–100.
+            # Normalisasi: jika > 100, bagi 10. Clamp ke 0–100.
+            raw_score  = float(data.get("score", 0) or 0)
+            if raw_score > 100:
+                print(f"[RUGCHECK WARN] {token_address[:8]} Score raw={raw_score:.0f} "
+                      f"— dinormalisasi ÷10 → {raw_score/10:.0f}/100")
+                raw_score = raw_score / 10
+            risk_level  = min(int(raw_score), 100)
             markets     = data.get("markets", []) or []
             lp_locked   = False
             lp_burned   = False
@@ -671,23 +691,37 @@ def check_safety(gmgn: dict, helius: dict, rugcheck: dict, tier: str) -> tuple:
 # ── PRE-PUMP PATTERN (T0) ─────────────────────────────────
 def check_prepump_pattern(price, open_c1, change_m5, change_h1, change_h6,
                           vol_m5, vol_h1, buys_m5, sells_m5, buys_h1, sells_h1,
-                          age_hours, holders) -> tuple:
+                          age_hours, holders, liq: float = 0, mcap: float = 0) -> tuple:
     score = 0; signals = []; warnings = []
     r_m5  = buys_m5 / max(sells_m5, 1)
     r_h1  = buys_h1 / max(sells_h1, 1)
     avg5m = vol_h1 / 12 if vol_h1 > 0 else 0
 
-    # Volume spike
+    # [ENH-B] Volume spike — tier lebih granular, spike 10x+ diberi bobot tertinggi
     if avg5m > 0:
         vol_ratio = vol_m5 / avg5m
-        if vol_ratio >= 5.0:
-            score += 5; signals.append(f"🔥 Volume spike {vol_ratio:.1f}x — early momentum!")
+        if vol_ratio >= VOL_SPIKE_EXTREME:
+            score += 8; signals.append(f"🚨 Volume EXTREME {vol_ratio:.1f}x — FOMO masuk!")
+        elif vol_ratio >= VOL_SPIKE_STRONG:
+            score += 6; signals.append(f"🔥 Volume spike {vol_ratio:.1f}x — early momentum!")
         elif vol_ratio >= 3.0:
             score += 4; signals.append(f"📊 Volume naik {vol_ratio:.1f}x")
         elif vol_ratio >= 2.0:
             score += 2; signals.append(f"📊 Volume naik {vol_ratio:.1f}x")
         elif vol_ratio < 0.5:
             warnings.append("⚠️ Volume masih sepi")
+
+    # [ENH-C] TX acceleration — banyak wallet masuk tiba-tiba = sinyal organik
+    tx_m5  = buys_m5 + sells_m5
+    avg_tx = (buys_h1 + sells_h1) / 12 if (buys_h1 + sells_h1) > 0 else 0
+    if avg_tx > 0:
+        tx_accel = tx_m5 / avg_tx
+        if tx_accel >= TX_ACCEL_EXTREME:
+            score += 5; signals.append(f"🌊 TX acceleration {tx_accel:.1f}x — serangan buyer organik!")
+        elif tx_accel >= TX_ACCEL_STRONG:
+            score += 3; signals.append(f"📈 TX naik {tx_accel:.1f}x — banyak wallet baru masuk")
+        elif tx_accel >= 1.5:
+            score += 1
 
     # Pump awal mulai
     if change_h6 >= T0_MIN_PUMP_PCT:
@@ -723,6 +757,14 @@ def check_prepump_pattern(price, open_c1, change_m5, change_h1, change_h6,
         score += 2; signals.append(f"✅ Harga di atas C1 (+{above_pct:.0f}%)")
     elif open_c1 > 0:
         warnings.append("⚠️ Harga di bawah C1")
+
+    # [ENH-A] Bonus liq/mcap ratio — pool dalam = susah dump
+    if mcap > 0 and liq > 0:
+        liq_ratio = liq / mcap
+        if liq_ratio >= LIQ_MCAP_RATIO_GOOD_T0:
+            score += 3; signals.append(f"💧 Pool dalam: liq/mcap {liq_ratio:.0%} — sangat sehat!")
+        elif liq_ratio >= LIQ_MCAP_RATIO_MIN_T0:
+            score += 1; signals.append(f"💧 Pool cukup: liq/mcap {liq_ratio:.0%}")
 
     return score, signals, warnings, 0.0
 
@@ -827,6 +869,11 @@ def check_core_pattern(price, open_c1, change_m5, change_h1, change_h6, change_h
 # ── DETERMINE TIER ────────────────────────────────────────
 def get_tier(mcap, liq, vol_h1) -> str | None:
     if T0_MIN_MCAP <= mcap <= T0_MAX_MCAP and liq >= T0_MIN_LIQUIDITY and vol_h1 >= T0_MIN_VOL_1H:
+        # [ENH-A] Liq/MCAP ratio filter — pool tipis mudah dimanipulasi
+        liq_ratio = liq / mcap if mcap > 0 else 0
+        if liq_ratio < LIQ_MCAP_RATIO_MIN_T0:
+            print(f"[T0 SKIP] MCAP=${mcap/1000:.0f}K liq_ratio={liq_ratio:.2f} < {LIQ_MCAP_RATIO_MIN_T0}")
+            return None
         return "T0"
     if T1_MIN_MCAP <= mcap <= T1_MAX_MCAP and liq >= T1_MIN_LIQUIDITY and vol_h1 >= T1_MIN_VOL_1H:
         return "T1"
@@ -916,13 +963,20 @@ def analyze_pair(pair: dict) -> dict | None:
             gmgn_data, helius_data, rugcheck_data, tier)
         if not safety_ok: return None
 
-        age_h     = gmgn_data.get("age_hours", 0)
+        # [BUG-CRIT-2 FIX] Jika GMGN gagal, age_hours = 0 (misleading).
+        # Fallback: gunakan pairCreatedAt dari DexScreener jika tersedia.
+        age_h = gmgn_data.get("age_hours", 0)
+        if not age_h:
+            pair_created = pair.get("pairCreatedAt", 0) or 0
+            if pair_created:
+                age_h = round((time.time() - pair_created / 1000) / 3600, 2)
+                print(f"[AGE FALLBACK] {addr[:8]} age dari DexScreener: {age_h:.1f}h")
         holders_n = gmgn_data.get("holders", 0)
 
         if tier == "T0":
             pattern_score, pattern_sig, pattern_warn, dip_pct = check_prepump_pattern(
                 price, open_c1, m5, h1, h6, vm5, vh1,
-                bm5, sm5, bh1, sh1, age_h, holders_n)
+                bm5, sm5, bh1, sh1, age_h, holders_n, liq, mcap)
             pump_pct = max(h6, h1)
         else:
             # [FIX #2] Kirim tracked_high bukan high24h DexScreener
