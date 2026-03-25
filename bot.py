@@ -6,21 +6,33 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v9.7 — AGE FALLBACK FIX
+#   DIP & RIP BOT v9.8 — NO MORE BAD ALERTS
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
 #
-#   CHANGELOG v9.7 (24 Mar 2026):
-#   [FIX v9.7] age_h fallback tidak efektif di v9.6 — dua instance:
-#     Instance 1: fallback dihitung SETELAH check_safety() dipanggil,
-#                 sehingga token dengan age=0 dibuang sebelum fallback
-#                 sempat menyelamatkannya.
-#     Instance 2: result dict pakai gmgn_data.get("age_hours",0) langsung,
-#                 bukan local var age_h yang sudah include fallback.
-#     Fix: pindahkan fallback ke SEBELUM check_safety, inject hasil ke
-#          gmgn_data via dict copy agar check_safety + result dict
-#          keduanya konsisten memakai nilai yang sudah benar.
+#   CHANGELOG v9.8 (25 Mar 2026):
+#   [v9.8-1] Hub & Spoke → universal hard reject di semua jalur.
+#            Sebelumnya hanya -3 score saat GMGN tersedia, bukan reject.
+#   [v9.8-2] T1/T2/T3 wajib GMGN tersedia — tanpa data LP/Bundle/Dev
+#            tidak ada dasar keputusan buy. Alert tanpa data = berbahaya.
+#   [v9.8-3] T0 wajib minimal Rugcheck tersedia + score >= 60.
+#            Sebelumnya T0 bisa alert hanya bermodalkan Helius saja.
+#   [v9.8-4] Grade C dihapus dari semua tier — bot sendiri bilang "lemah"
+#            tapi tetap kirim entry zone. Kontradiktif dan membingungkan.
+#   [v9.8-5] C1 threshold konsisten — check_prepump_pattern sebelumnya
+#            pakai exact check (price >= open_c1) sehingga muncul dua
+#            pesan bertentangan: "Hold YA ✅" sekaligus "⚠️ di bawah C1".
+#            Fix: pakai toleransi 0.9x di kedua tempat.
+#   [v9.8-6] age_h fallback aktif SEBELUM check_safety (dari v9.7) dan
+#            di-inject ke gmgn_data agar check_safety pakai nilai benar.
+#   [v9.8-7] Holders "0" misleading → None saat GMGN tidak tersedia,
+#            ditampilkan sebagai "N/A" di alert bukan "0".
+#   [v9.8-8] Top10 grey zone 30–40% diberi penalti -1 score.
+#   [v9.8-9] Smart Money "Netral" disembunyikan saat GMGN tidak tersedia
+#            karena nilainya selalu 0/0 = tidak informatif sama sekali.
 #
-#   ORIGINAL CHANGELOG v9.6 (23 Mar 2026) — 9 fixes dari v9.5:
+#   CARRIED OVER FROM v9.6 (9 fixes + 5 post-review bugfixes):
+#   Semua fix v9.6 tetap aktif, tidak ada yang diregresi.
+# ══════════════════════════════════════════════════════════
 #   [FIX #1] dev_pct logika terbalik — dev_token_burn_ratio
 #            adalah token yang DIBAKAR (tinggi = bagus).
 #   [FIX #2] high24h selalu 0 — tracking high internal.
@@ -545,16 +557,22 @@ def check_safety(gmgn: dict, helius: dict, rugcheck: dict, tier: str) -> tuple:
     if gmgn.get("rug_ratio", 0) > 0.8:
         return False, -100, [], ["🔴 RUG RATIO TINGGI!"], "DANGER"
 
+    # [v9.8-1] Hub & Spoke → UNIVERSAL HARD REJECT di semua jalur.
+    # Sebelumnya hanya -3 score saat masuk blok scoring Helius,
+    # sehingga token dengan distribusi tidak wajar tetap bisa lolos.
+    if helius.get("available") and helius.get("hub_spoke"):
+        return False, -100, [], ["🔴 Hub & Spoke terdeteksi — distribusi tidak wajar!"], "DANGER"
+
     # Tentukan sumber data
     lp_burned = None; lp_source = "N/A"
-    bundle_pct = None; dev_burned_pct = None   # [FIX #1] renamed
+    bundle_pct = None; dev_burned_pct = None
     holders = None; age_hours = None
     smart_buy = 0; smart_sell = 0
 
     if gmgn.get("available"):
         lp_burned      = gmgn.get("lp_burned", 0)
         bundle_pct     = gmgn.get("bundle_pct", 0)
-        dev_burned_pct = gmgn.get("dev_burned_pct", None)   # [FIX #1]
+        dev_burned_pct = gmgn.get("dev_burned_pct", None)
         holders        = gmgn.get("holders", 0)
         age_hours      = gmgn.get("age_hours", 0)
         smart_buy      = gmgn.get("smart_buy", 0)
@@ -565,7 +583,19 @@ def check_safety(gmgn: dict, helius: dict, rugcheck: dict, tier: str) -> tuple:
                      50.0  if rugcheck.get("lp_locked") else 0.0)
         lp_source = "Rugcheck"
 
-    # Hard reject per tier
+    # [v9.8-2] T1/T2/T3 wajib GMGN — tanpa LP/Bundle/Dev tidak ada
+    # dasar keputusan. Alert dengan semua field N/A = alert berbahaya.
+    # [v9.8-3] T0 wajib minimal Rugcheck tersedia + score >= 60.
+    if tier in ["T1", "T2", "T3"]:
+        if not gmgn.get("available"):
+            return False, 0, [], [], ""
+    elif tier == "T0":
+        if not gmgn.get("available") and not rugcheck.get("available"):
+            return False, 0, [], [], ""
+        if rugcheck.get("available") and rugcheck.get("score", 0) < 60:
+            return False, 0, [], [], ""
+
+    # Per-tier threshold checks
     if gmgn.get("available"):
         age = gmgn.get("age_hours", 0)
         if tier == "T0":
@@ -579,19 +609,6 @@ def check_safety(gmgn: dict, helius: dict, rugcheck: dict, tier: str) -> tuple:
             if age < MIN_TOKEN_AGE_T2: return False, 0, [], [], ""
             if lp_burned is not None and lp_burned < MIN_LP_BURNED_T2: return False, 0, [], [], ""
             if holders is not None and holders < MIN_HOLDERS_T2: return False, 0, [], [], ""
-    elif rugcheck.get("available"):
-        if lp_burned == 0 and tier == "T1": return False, 0, [], [], ""
-    else:
-        if not helius.get("available"):
-            if tier in ["T1", "T2"]: return False, 0, [], [], ""
-        else:
-            top10 = helius.get("top10_pct", 100)
-            hub   = helius.get("hub_spoke", True)
-            if hub: return False, 0, [], ["🔴 Hub & Spoke!"], ""
-            if top10 > HELIUS_MAX_TOP10: return False, 0, [], [f"🔴 Top10 {top10:.0f}%!"], ""
-            score += 3
-            signals.append(f"✅ Helius proxy OK — Top10: {top10:.1f}%")
-            warnings.append("⚠️ Safety dari Helius proxy saja")
 
     # Scoring LP Burned
     if lp_burned is not None:
@@ -676,17 +693,16 @@ def check_safety(gmgn: dict, helius: dict, rugcheck: dict, tier: str) -> tuple:
     elif sm < -5:
         score -= 1; warnings.append(f"⚠️ Smart money NET SELL {sm}")
 
-    # Helius Top10
+    # Helius Top10 — Hub & Spoke sudah di-reject di atas, tidak perlu cek ulang
     if helius.get("available"):
         top10 = helius.get("top10_pct", 0)
-        hub   = helius.get("hub_spoke", False)
-        if hub:
-            score -= 3; warnings.append("🔴 Hub & Spoke pattern!")
-        elif top10 <= 10:
+        if top10 <= 10:
             score += 3; signals.append(f"✅ Top 10 hanya {top10:.1f}% — sempurna!")
-        elif top10 <= MAX_TOP10_PCT:
+        elif top10 <= MAX_TOP10_PCT:   # <= 30%
             score += 2; signals.append(f"✅ Top 10: {top10:.1f}%")
-        elif top10 > 40:
+        elif top10 <= 40:              # [v9.8-8] 30–40% grey zone → penalti kecil
+            score -= 1; warnings.append(f"⚠️ Top 10 agak tinggi: {top10:.1f}%")
+        else:                          # > 40%
             score -= 2; warnings.append(f"🔴 Top 10 tinggi: {top10:.1f}%!")
 
     critical = [w for w in warnings if w.startswith("🔴")]
@@ -762,8 +778,10 @@ def check_prepump_pattern(price, open_c1, change_m5, change_h1, change_h6,
     elif age_hours <= 3.0:
         score += 1; signals.append(f"🆕 Token fresh: {age_hours:.1f}h")
 
-    # Harga di atas C1
-    if open_c1 > 0 and price >= open_c1:
+    # [v9.8-5] Harga vs C1 — pakai toleransi 0.9x agar konsisten
+    # dengan result dict (holds_c1 = price >= open_c1 * 0.9).
+    # Sebelumnya: exact check → muncul dua pesan bertentangan di alert.
+    if open_c1 > 0 and price >= open_c1 * 0.9:
         above_pct = ((price - open_c1) / open_c1 * 100)
         score += 2; signals.append(f"✅ Harga di atas C1 (+{above_pct:.0f}%)")
     elif open_c1 > 0:
@@ -970,18 +988,15 @@ def analyze_pair(pair: dict) -> dict | None:
         helius_data   = get_helius(addr)
         rugcheck_data = get_rugcheck(addr)
 
-        # [v9.7 FIX] age_h fallback dipindah ke SEBELUM check_safety.
-        # Bug v9.6: fallback dihitung setelah check_safety → token dibuang
-        # lebih dulu karena age = 0, fallback tidak pernah terpakai.
-        # Fix: hitung fallback dulu, inject ke gmgn_data agar check_safety
-        # dan result dict keduanya memakai nilai yang sudah benar.
+        # [v9.8-6] age_h fallback SEBELUM check_safety agar tidak terlambat.
+        # Jika GMGN gagal, ambil dari pairCreatedAt DexScreener, lalu
+        # inject ke gmgn_data sehingga check_safety pakai nilai yang benar.
         age_h = gmgn_data.get("age_hours", 0)
         if not age_h:
             pair_created = pair.get("pairCreatedAt", 0) or 0
             if pair_created:
                 age_h = round((time.time() - pair_created / 1000) / 3600, 2)
                 print(f"[AGE FALLBACK] {addr[:8]} age dari DexScreener: {age_h:.1f}h")
-                # Inject balik ke gmgn_data agar check_safety pakai nilai ini
                 gmgn_data = {**gmgn_data, "age_hours": age_h}
 
         safety_ok, safety_score, safety_sig, safety_warn, safety_sum = check_safety(
@@ -1014,28 +1029,26 @@ def analyze_pair(pair: dict) -> dict | None:
         critical = [w for w in all_warnings if w.startswith("🔴")]
         if len(critical) >= 2: return None
 
-        # Grade per tier
+        # Grade per tier — [v9.8-4] Grade C dihapus.
+        # Bot bilang "lemah" tapi tetap kirim entry zone = kontradiktif.
+        # Alert hanya dikirim jika setup cukup layak (Grade B ke atas).
         if tier == "T0":
             if total >= 15:   grade, status = "A",  "🔥 PRE-PUMP! Entry ultra early!"
-            elif total >= 10: grade, status = "B",  "🟡 Sinyal awal ada"
-            elif total >= 6:  grade, status = "C",  "🟠 Lemah, monitor dulu"
+            elif total >= 10: grade, status = "B",  "🟡 Sinyal awal ada — monitor ketat"
             else: return None
         elif tier == "T1":
             if total >= 20:   grade, status = "A",  "🟢 Setup bagus — EARLY!"
             elif total >= 13: grade, status = "B",  "🟡 Setup cukup"
-            elif total >= 7:  grade, status = "C",  "🟠 Setup lemah"
             else: return None
         elif tier == "T2":
             if total >= 24:   grade, status = "A+", "💎 Setup premium!"
             elif total >= 18: grade, status = "A",  "🟢 Setup sangat bagus!"
             elif total >= 12: grade, status = "B",  "🟡 Setup cukup"
-            elif total >= 6:  grade, status = "C",  "🟠 Setup lemah"
             else: return None
-        else:
+        else:  # T3
             if total >= 26:   grade, status = "A+", "💎 Setup premium!"
             elif total >= 20: grade, status = "A",  "🟢 Setup bagus"
             elif total >= 13: grade, status = "B",  "🟡 Setup cukup"
-            elif total >= 7:  grade, status = "C",  "🟠 Setup lemah"
             else: return None
 
         pos_map = {"T0": T0_MAX_POSITION, "T1": T1_MAX_POSITION,
@@ -1064,8 +1077,10 @@ def analyze_pair(pair: dict) -> dict | None:
                           50.0  if rugcheck_data.get("lp_locked") else None)),
             "bundle_pct":    gmgn_data.get("bundle_pct")    if gmgn_data.get("available") else None,
             "dev_burned_pct": gmgn_data.get("dev_burned_pct") if gmgn_data.get("available") else None,
-            "holders":    gmgn_data.get("holders", 0) if gmgn_data.get("available") else 0,
-            "age_h":      age_h,   # [v9.7 FIX] pakai local var yg sudah include fallback
+            # [v9.8-7] holders → None saat GMGN tidak tersedia.
+            # Sebelumnya default 0 yang terlihat seperti "0 holders" di alert.
+            "holders":       gmgn_data.get("holders") if gmgn_data.get("available") else None,
+            "age_h":         age_h,   # [v9.8-6] local var sudah include fallback DexScreener
             "smart_buy":  gmgn_data.get("smart_buy", 0),
             "smart_sell": gmgn_data.get("smart_sell", 0),
             "gmgn_ok":    gmgn_data.get("available", False),
@@ -1134,7 +1149,16 @@ def format_alert(s: dict) -> str:
              "⚠️" if dev is not None else "❓")
 
     sm   = s['smart_buy'] - s['smart_sell']
-    sm_t = f"+{sm} NET BUY 🟢" if sm > 0 else (f"{sm} NET SELL 🔴" if sm < 0 else "Netral")
+    # [v9.8-9] Smart Money hanya tampil jika GMGN tersedia.
+    # Saat GMGN tidak ada, nilai selalu 0/0 = "Netral" yang tidak informatif.
+    if s.get("gmgn_ok"):
+        sm_t = f"+{sm} NET BUY 🟢" if sm > 0 else (f"{sm} NET SELL 🔴" if sm < 0 else "Netral")
+        sm_line = f"\n  💡 Smart $: {sm_t}"
+    else:
+        sm_line = ""
+
+    # [v9.8-7] Holders: tampilkan N/A jika data tidak tersedia (bukan "0")
+    holders_str = f"{s['holders']:,}" if s.get('holders') is not None else "N/A"
 
     helius_block = ""
     if s["helius_ok"]:
@@ -1166,7 +1190,7 @@ def format_alert(s: dict) -> str:
                 if s["tier"] == "T0" else "⚡ Konfirmasi LP Burned & Bundle di Axiom!")
 
     return f"""
-🚨 <b>DIP &amp; RIP ALERT v9.7!</b> {mode_lbl}
+🚨 <b>DIP &amp; RIP ALERT v9.8!</b> {mode_lbl}
 
 {temoji} <b>{tlabel}</b>
 📍 {tdesc}
@@ -1189,8 +1213,7 @@ def format_alert(s: dict) -> str:
   {lp_e} LP Burned: <b>{lp_str}</b>
   {bun_e} Bundle: <b>{bun_str}</b>
   {dev_e} Dev Burned: <b>{dev_str}</b>
-  👥 Holders: <b>{s['holders']:,}</b>
-  💡 Smart $: {sm_t}{rc_block}{helius_block}{social_block}
+  👥 Holders: <b>{holders_str}</b>{sm_line}{rc_block}{helius_block}{social_block}
 
 ✅ <b>SINYAL:</b>
 {signals_text}
@@ -1254,9 +1277,9 @@ def scan_once():
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v9.7 — AGE FALLBACK FIX")
+    print("  DIP & RIP BOT v9.8 — NO MORE BAD ALERTS")
     print("  Core: Token Aman + Dump Sehat + Second Pump")
-    print("  FIX : age_h fallback sekarang aktif sebelum safety check")
+    print("  RULE: Tidak ada alert tanpa data pendukung wajib")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY else '⚠️ Belum ada key'}")
     print(f"  Lunar   : {'✅' if LUNARCRUSH_KEY else '⚠️ Belum ada key'}")
@@ -1268,16 +1291,19 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.7 aktif!</b>\n\n"
-        "🔧 <b>Fix: age_h fallback (v9.7)</b>\n\n"
-        "🔴 <b>Bug yang diperbaiki:</b>\n"
-        "   Di v9.6, fallback umur token dari DexScreener\n"
-        "   dihitung SETELAH check_safety() — artinya token\n"
-        "   dengan age=0 sudah dibuang lebih dulu.\n\n"
-        "✅ <b>Fix v9.7:</b>\n"
-        "   Fallback dipindah SEBELUM check_safety\n"
-        "   Hasil di-inject ke gmgn_data agar konsisten\n"
-        "   Result dict kini pakai age_h yang benar\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.8 aktif!</b>\n\n"
+        "🛡️ <b>v9.8 — No More Bad Alerts:</b>\n\n"
+        "🔴 <b>Gate baru (alert ditolak jika):</b>\n"
+        "   ✅ Hub &amp; Spoke → hard reject di semua jalur\n"
+        "   ✅ T1/T2/T3 tanpa GMGN → ditolak\n"
+        "   ✅ T0 tanpa Rugcheck ≥60 → ditolak\n"
+        "   ✅ Grade C → tidak lagi di-alert\n\n"
+        "🔧 <b>Fix logika &amp; display:</b>\n"
+        "   ✅ C1 konsisten — tidak ada pesan bertentangan\n"
+        "   ✅ age_h fallback aktif sebelum safety check\n"
+        "   ✅ Holders N/A bukan 0 saat GMGN tidak ada\n"
+        "   ✅ Top10 30–40% dapat penalti score\n"
+        "   ✅ Smart Money disembunyikan saat data N/A\n\n"
         "🚨 Scan setiap 30 detik!"
     )
 
