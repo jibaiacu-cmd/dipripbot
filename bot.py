@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v9.9 — CHART IS KING
+#   DIP & RIP BOT v9.9.1 — CHART IS KING
 #   Core Philosophy: Chart Dulu, Data Pendukung Kemudian
 #
 #   ARSITEKTUR BARU:
@@ -47,6 +47,19 @@ from pathlib import Path
 #   [v9.9-9] Dual alert: token yang sama dalam 15 menit berlabel
 #            🔄 UPDATE bukan alert baru.
 #   [CARRIED] Semua fix v9.6–v9.8 tetap aktif.
+#
+#   CHANGELOG v9.9.1 (28 Mar 2026):
+#   [v9.9.1-F1] SPIKE TOO LATE: m5 > 150% → skip langsung.
+#               Evidence: pisscoin +262%→1x, Dojo +323%→2x.
+#               Win rate 0% di atas threshold ini (3 kasus).
+#   [v9.9.1-F2] ALREADY PEAKED: h1 < -30% + Hold C1 TIDAK → skip.
+#               Evidence: USD, GAMEOVER, Mythos semua <1.2x.
+#               Konfirmasi distribusi aktif sebelum alert masuk.
+#   [v9.9.1-F3] MCAP LATE ENTRY: MCAP > threshold tier → skip.
+#               T0 max $85K, dengan pengurangan untuk token muda.
+#               Token age N/A: ×0.4 | <0.5h: ×0.3 | <1h: ×0.5
+#               Evidence: 5/5 token Batch 4 loss karena late MCAP.
+#               Filter dipasang SEBELUM API calls → hemat resources.
 # ══════════════════════════════════════════════════════════
 
 # ── CONFIG ──────────────────────────────────────────────
@@ -924,7 +937,39 @@ def analyze_pair(pair: dict) -> dict | None:
         pair_created = pair.get("pairCreatedAt", 0) or 0
         age_h_fallback = round((time.time() - pair_created / 1000) / 3600, 2) if pair_created else 0
 
-        # ── GATE 2: API calls (hanya kalau pattern ada) ───
+        # ── [v9.9.1] GATE 1.5: EARLY EXIT FILTERS ────────
+        # Evidence-based dari 29 token dataset.
+        # Dipasang SEBELUM API calls → hemat GMGN/Rugcheck/Helius.
+
+        # [F1] Spike Too Late
+        # m5 > 150% = bot deteksi SAAT candle spike, bukan sebelumnya.
+        # Win rate 0% di atas threshold ini. Dataset: pisscoin, Dojo.
+        if m5 > 150:
+            print(f"[F1 SKIP] {symbol} m5 {m5:.1f}% > 150% — spike too late")
+            return None
+
+        # [F2] Already Peaked
+        # h1 sangat negatif + harga sudah tembus C1 = distribusi aktif.
+        # Dataset: USD h1 -24%→<1x, GAMEOVER distribusi aktif.
+        _holds_c1_check = price >= open_c1 * 0.9 if open_c1 > 0 else True
+        if h1 < -30 and not _holds_c1_check:
+            print(f"[F2 SKIP] {symbol} h1 {h1:.1f}% + no Hold C1 — already peaked")
+            return None
+
+        # [F3] MCAP Late Entry
+        # Entry terlalu jauh dari kelahiran token = harga sudah naik duluan.
+        # Threshold makin ketat untuk token lebih muda (age bands).
+        # Dataset: 5/5 token Batch 4 loss karena MCAP terlalu tinggi saat alert.
+        _f3_threshold = {"T0": 85_000, "T1": 200_000,
+                         "T2": 700_000, "T3": 2_500_000}.get(tier, 85_000)
+        if age_h_fallback == 0:       _f3_threshold *= 0.40  # N/A = unknown = paling konservatif
+        elif age_h_fallback < 0.5:    _f3_threshold *= 0.30  # < 30 menit
+        elif age_h_fallback < 1.0:    _f3_threshold *= 0.50  # 30–60 menit
+        # > 1 jam = threshold normal, tidak ada pengurangan
+        if mcap > _f3_threshold:
+            print(f"[F3 SKIP] {symbol} MCAP ${mcap:,.0f} > ${_f3_threshold:,.0f} "
+                  f"(tier {tier}, age {age_h_fallback:.1f}h) — late entry")
+            return None
         gmgn_data     = get_gmgn(addr)
         helius_data   = get_helius(addr)
         rugcheck_data = get_rugcheck(addr)
@@ -1068,7 +1113,7 @@ def format_alert(s: dict, is_update: bool = False) -> str:
     grade_emoji = {"A+":"💎","A":"🏆","B":"🥈"}.get(s["grade"],"")
 
     # [v9.9-9] Label UPDATE untuk alert token yang sama
-    alert_label = "🔄 UPDATE ALERT v9.9!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9!"
+    alert_label = "🔄 UPDATE ALERT v9.9.1!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.1!"
     mode_lbl    = "🔥 PRE-PUMP MODE" if s["tier"] == "T0" else "📉 DIP &amp; RIP MODE"
 
     signals_text = "\n".join(s["signals"])  if s["signals"]  else "—"
@@ -1233,7 +1278,7 @@ def scan_once():
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v9.9 — CHART IS KING")
+    print("  DIP & RIP BOT v9.9.1 — CHART IS KING")
     print("  Pattern primer, safety sekunder")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY else '⚠️ Belum ada key'}")
@@ -1246,20 +1291,17 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.9 aktif!</b>\n\n"
-        "🔑 <b>Filosofi baru: Chart adalah keputusan</b>\n\n"
-        "📊 <b>Arsitektur baru:</b>\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.9.1 aktif!</b>\n\n"
+        "🔑 <b>Filosofi: Chart adalah keputusan</b>\n\n"
+        "📊 <b>Arsitektur:</b>\n"
         "   1️⃣ Chart pattern → primer\n"
-        "   2️⃣ Hard reject → bahaya konkrit saja\n"
-        "   3️⃣ Safety data → confidence booster\n\n"
-        "✅ <b>Yang berubah:</b>\n"
-        "   Data N/A → 0 score (netral, bukan reject)\n"
-        "   Hub&amp;Spoke T0 → -5 score (bukan reject)\n"
-        "   Named risks (copycat dll) → hard reject\n"
-        "   Top 10 > 70% → hard reject\n"
-        "   Safety bar 0–100 kembali\n"
-        "   Sniper count kembali\n"
-        "   Alert sama = label 🔄 UPDATE\n\n"
+        "   2️⃣ Early exit filters v9.9.1 → evidence-based\n"
+        "   3️⃣ Hard reject → bahaya konkrit saja\n"
+        "   4️⃣ Safety data → confidence booster\n\n"
+        "🆕 <b>Filter baru v9.9.1 (dari 29 token dataset):</b>\n"
+        "   [F1] m5 > 150% → SKIP (spike too late)\n"
+        "   [F2] h1 &lt; -30% + no Hold C1 → SKIP (peaked)\n"
+        "   [F3] MCAP > threshold tier → SKIP (late entry)\n\n"
         "🚨 Scan setiap 30 detik!"
     )
 
