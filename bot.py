@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v9.9.2 — CHART IS KING
+#   DIP & RIP BOT v9.9.3 — CHART IS KING
 #   Core Philosophy: Chart Dulu, Data Pendukung Kemudian
 #
 #   ARSITEKTUR BARU:
@@ -77,6 +77,13 @@ from pathlib import Path
 #               Fix bug BBQ (age 0.6h tidak tertangkap F3).
 #   [v9.9.2-FX3] Hold C1: skip check jika token age < 1h.
 #               Evidence: WON (0.5h, Hold C1 TIDAK) → 3.8x.
+#               Display holds_c1 juga neutral (True) untuk age < 1h.
+#   [v9.9.2-FIX1] Pump Memory: update_pump_memory SETELAH hard reject.
+#               Token honeypot tidak masuk watchlist bounce.
+#   [v9.9.2-FIX2] Single call check_watchlist_bounce (eliminasi
+#               double call yang berpotensi state race condition).
+#   [v9.9.2-FIX3] age_h_fallback di-clamp >= 0 (guard timestamp
+#               masa depan dari API yang bermasalah).
 # ══════════════════════════════════════════════════════════
 
 # ── CONFIG ──────────────────────────────────────────────
@@ -195,12 +202,22 @@ UPDATE_LABEL_WINDOW_SEC = 900  # [v9.9-9] 15 menit = label UPDATE
 F4_PEAK_POSITION        = 0.85   # Harga di >85% dari range h1 → SKIP
 F4_BASE_POSITION_BONUS  = 0.30   # Harga di <30% dari range → bonus score +3
 
-# [PM] Pump Memory Watchlist
+# [PM] Pump Memory Watchlist — v9.9.3 constants
 PM_PUMP_THRESHOLD       = 150.0  # h6 atau h1 > 150% → catat sebagai pump besar
-PM_DUMP_THRESHOLD       = 0.35   # current_mcap < peak * 0.35 = dump >65% → watchlist aktif
 PM_BUYER_RATIO_MIN      = 10.0   # buyer_ratio_m5 minimum untuk trigger watchlist alert
 PM_POSITION_MAX         = 0.25   # price_position harus < 25% dari range (di dasar)
 PM_WATCHLIST_COOLDOWN   = 3600   # 1 jam cooldown antar watchlist alert
+
+# [v9.9.3-BF] Birth Floor constants
+PM_BIRTH_FLOOR_RATIO_MIN = 1.00  # MCAP minimal 1.0x dari birth floor (tidak di bawah)
+PM_BIRTH_FLOOR_RATIO_MAX = 1.80  # MCAP maksimal 1.8x dari birth floor (masih dekat)
+PM_BIRTH_PEAK_MIN_RATIO  = 3.0   # Peak minimal 3x dari birth floor (pump signifikan)
+PM_FLOOR_UNCERTAIN_AGE   = 6.0   # Token > 6h saat pertama terdeteksi → floor tidak reliable
+
+# [v9.9.3-HD] Healthy Dump constants
+PM_HD_H1_H6_MAX_RATIO    = 0.70  # h1_magnitude max 70% dari h6_magnitude
+PM_HD_M5_MAX_DUMP        = -15.0 # m5 tidak boleh < -15% (dump masih aktif)
+PM_HD_MIN_SCAN_COUNT     = 6     # Minimal 6 scan bertahap (3 menit) untuk dump sehat
 
 # ── CACHE ────────────────────────────────────────────────
 gmgn_cache     = {}
@@ -920,56 +937,166 @@ def get_sl_tp(price: float, tier: str) -> tuple:
             price * tp2_map.get(tier, 3.0),
             int((1 - sl_pct) * 100))
 
-# ── [v9.9.2-PM] PUMP MEMORY FUNCTIONS ───────────────────
-def update_pump_memory(addr: str, mcap: float, h6: float, h1: float):
+# ── [v9.9.3-PM3] PUMP MEMORY FUNCTIONS v3 ───────────────
+
+def update_pump_memory(addr: str, mcap: float, h6: float, h1: float,
+                       age_h: float = 0):
     """
-    Catat token yang pernah pump besar.
-    Dipanggil setiap kali token lolos pattern check.
+    [v9.9.3] Catat token dengan tracking Birth Floor & Healthy Dump.
+
+    Birth Floor: min_mcap_seen = MCAP terendah yang pernah terlihat.
+    Ini adalah proxy dari 'birth candle low'. Semakin awal token
+    terdeteksi, semakin akurat nilai ini.
+
+    Dump Tracking: dump_scan_count naik setiap scan saat MCAP turun,
+    reset jika rebound > 5%. Minimal 6 scan = dump bertahap (sehat).
     """
     global pump_memory
+    now      = time.time()
+    existing = pump_memory.get(addr, {})
+
+    # Inisialisasi record baru jika belum ada
+    if not existing:
+        pump_memory[addr] = {
+            "peak_mcap":       mcap,
+            "peak_ts":         now,
+            "min_mcap_seen":   mcap,   # [BF] birth floor proxy
+            "first_seen_age":  age_h,  # [BF] umur token saat pertama terdeteksi
+            "first_seen_ts":   now,
+            "last_mcap_seen":  mcap,
+            "dump_scan_count": 0,      # [HD] counter scan penurunan bertahap
+            "status":          "new",
+            "last_alert":      0,
+        }
+        print(f"[PM NEW] {addr[:8]} init MCAP ${mcap:,.0f} age {age_h:.1f}h")
+        return
+
+    # Update peak
+    if mcap > existing.get("peak_mcap", 0):
+        pump_memory[addr]["peak_mcap"] = mcap
+        pump_memory[addr]["peak_ts"]   = now
+        pump_memory[addr]["dump_scan_count"] = 0  # reset saat buat peak baru
+        print(f"[PM PEAK] {addr[:8]} new peak ${mcap:,.0f} (pump max {max(h6,h1):.0f}%)")
+
+    # [BF] Update birth floor — catat MCAP terendah yang pernah terlihat
+    if mcap < existing.get("min_mcap_seen", mcap):
+        pump_memory[addr]["min_mcap_seen"] = mcap
+        print(f"[PM FLOOR] {addr[:8]} new floor ${mcap:,.0f}")
+
+    # [HD] Dump scan tracking — hitung berapa scan harga turun bertahap
+    prev_mcap = existing.get("last_mcap_seen", mcap)
+    if mcap < prev_mcap * 0.99:        # turun > 1% dari scan sebelumnya
+        pump_memory[addr]["dump_scan_count"] = existing.get("dump_scan_count", 0) + 1
+    elif mcap > prev_mcap * 1.05:      # rebound > 5% → reset counter
+        pump_memory[addr]["dump_scan_count"] = 0
+    pump_memory[addr]["last_mcap_seen"] = mcap
+
+    # Tandai sebagai "watching" jika sudah pernah pump besar
     pump_pct = max(h6, h1)
-    if pump_pct >= PM_PUMP_THRESHOLD:
-        existing = pump_memory.get(addr, {})
-        if mcap > existing.get("peak_mcap", 0):
-            pump_memory[addr] = {
-                "peak_mcap": mcap,
-                "peak_ts":   time.time(),
-                "birth_mcap": existing.get("birth_mcap", mcap),
-                "status":    "watching",
-                "last_alert": existing.get("last_alert", 0),
-            }
-            print(f"[PM] {addr[:8]} dicatat peak ${mcap:,.0f} (pump {pump_pct:.0f}%)")
+    if pump_pct >= PM_PUMP_THRESHOLD and existing.get("status") == "new":
+        pump_memory[addr]["status"] = "watching"
+        print(f"[PM WATCH] {addr[:8]} pump {pump_pct:.0f}% → watching")
+
+
+def is_healthy_dump(h1: float, h6: float, m5: float,
+                    dump_scan_count: int) -> tuple[bool, str]:
+    """
+    [v9.9.3-HD] Cek apakah dump yang terjadi adalah dump SEHAT.
+
+    Dump sehat = penurunan bertahap oleh 3+ candle, bukan 1-2 candle
+    merah panjang (yang bisa jadi rug atau manipulation).
+
+    Dua lapis:
+    (A) Timeframe proxy: sebagian besar dump harus terjadi SEBELUM 1 jam
+        terakhir. Kalau h1_magnitude > 70% dari h6_magnitude, dump
+        masih terlalu baru / cepat.
+    (B) Scan tracking: bot harus melihat minimal 6 scan penurunan
+        bertahap (= 3 menit dengan interval 30 detik).
+
+    Returns: (is_healthy: bool, reason: str)
+    """
+    # Cek (B) dulu — paling cepat
+    if dump_scan_count < PM_HD_MIN_SCAN_COUNT:
+        return False, f"dump_scan {dump_scan_count} < {PM_HD_MIN_SCAN_COUNT} (terlalu cepat)"
+
+    # Cek dump masih aktif
+    if m5 < PM_HD_M5_MAX_DUMP:
+        return False, f"m5 {m5:.1f}% < {PM_HD_M5_MAX_DUMP}% (dump masih aktif)"
+
+    # Cek (A) — h6 harus jauh lebih besar dari h1 (dump sudah lama)
+    h6_mag = abs(h6)
+    h1_mag = abs(h1)
+    if h6_mag > 0 and h1_mag / h6_mag > PM_HD_H1_H6_MAX_RATIO:
+        return False, (f"h1/h6 ratio {h1_mag/h6_mag:.0%} > {PM_HD_H1_H6_MAX_RATIO:.0%} "
+                       f"(dump terlalu baru)")
+
+    return True, "OK"
+
 
 def check_watchlist_bounce(addr: str, mcap: float,
                            buyer_ratio_m5: float,
-                           price_position: float) -> bool:
+                           price_position: float,
+                           h1: float = 0, h6: float = 0,
+                           m5: float = 0) -> bool:
     """
-    Cek apakah token dari watchlist menunjukkan sinyal bounce.
-    Returns True jika kondisi terpenuhi dan cooldown habis.
+    [v9.9.3-PM3] PM Watchlist v3 — Birth Floor + Healthy Dump.
+
+    Kondisi SEMUA harus terpenuhi:
+    1. Token pernah pump > 3x dari birth floor (pump signifikan)
+    2. Current MCAP dalam range 1.0x–1.8x dari birth floor
+       (harga kembali ke area lahir, bukan dead di bawahnya)
+    3. Floor tidak uncertain (token tidak terlalu tua saat pertama terlihat)
+    4. Dump sehat — tidak terjadi instan 1-2 candle
+    5. Buyer ratio & price position konfirmasi akumulasi
+    6. Cooldown belum habis
     """
     mem = pump_memory.get(addr)
     if not mem:
         return False
-    peak = mem.get("peak_mcap", 0)
-    if peak <= 0:
+    if mem.get("status") not in ("watching", "alerted"):
         return False
 
-    # Harus sudah dump >65% dari peak
-    if mcap > peak * PM_DUMP_THRESHOLD:
+    peak        = mem.get("peak_mcap", 0)
+    birth_floor = mem.get("min_mcap_seen", 0)
+    first_age   = mem.get("first_seen_age", 0)
+    dump_scans  = mem.get("dump_scan_count", 0)
+
+    if peak <= 0 or birth_floor <= 0:
         return False
 
-    # Buyer ratio dan price position harus memenuhi syarat
+    # [BF-1] Floor reliability — token terlalu tua saat pertama terdeteksi
+    # Bot mungkin tidak lihat birth candle yang sesungguhnya
+    if first_age > PM_FLOOR_UNCERTAIN_AGE:
+        print(f"[PM SKIP] {addr[:8]} floor uncertain (first seen {first_age:.1f}h)")
+        return False
+
+    # [BF-2] Peak harus minimal 3x dari birth floor (pump cukup besar)
+    if peak < birth_floor * PM_BIRTH_PEAK_MIN_RATIO:
+        return False
+
+    # [BF-3] Current MCAP harus dalam range birth floor zone
+    floor_ratio = mcap / birth_floor
+    if not (PM_BIRTH_FLOOR_RATIO_MIN <= floor_ratio <= PM_BIRTH_FLOOR_RATIO_MAX):
+        return False
+
+    # [HD] Dump harus sehat — bertahap, bukan instan
+    healthy, hd_reason = is_healthy_dump(h1, h6, m5, dump_scans)
+    if not healthy:
+        print(f"[PM SKIP] {addr[:8]} dump tidak sehat — {hd_reason}")
+        return False
+
+    # [ACC] Akumulasi: buyer dominan di dasar range
     if buyer_ratio_m5 < PM_BUYER_RATIO_MIN:
         return False
     if price_position > PM_POSITION_MAX:
         return False
 
-    # Cooldown check
-    last = mem.get("last_alert", 0)
-    if time.time() - last < PM_WATCHLIST_COOLDOWN:
+    # Cooldown
+    if time.time() - mem.get("last_alert", 0) < PM_WATCHLIST_COOLDOWN:
         return False
 
     return True
+
 
 def mark_watchlist_alerted(addr: str):
     """Update timestamp last alert di pump memory."""
@@ -1075,7 +1202,7 @@ def analyze_pair(pair: dict) -> dict | None:
 
         # ── Age fallback sebelum API calls ────────────────
         pair_created = pair.get("pairCreatedAt", 0) or 0
-        age_h_fallback = round((time.time() - pair_created / 1000) / 3600, 2) if pair_created else 0
+        age_h_fallback = max(0.0, round((time.time() - pair_created / 1000) / 3600, 2)) if pair_created else 0
 
         # ── [v9.9.1] GATE 1.5: EARLY EXIT FILTERS ────────
         # Evidence-based dari 29 token dataset.
@@ -1115,10 +1242,6 @@ def analyze_pair(pair: dict) -> dict | None:
                   f"(tier {tier}, age {age_h_fallback:.1f}h) — late entry")
             return None
 
-        # [v9.9.2-PM] Update pump memory SEBELUM API calls
-        # Catat setiap token dengan pump besar agar bisa dideteksi saat bounce
-        update_pump_memory(addr, mcap, h6, h1)
-
         gmgn_data     = get_gmgn(addr)
         helius_data   = get_helius(addr)
         rugcheck_data = get_rugcheck(addr)
@@ -1141,18 +1264,22 @@ def analyze_pair(pair: dict) -> dict | None:
         # Evidence: bot tidak bisa bedakan spike vs akumulasi tanpa ini
         r_m5_val = bm5 / max(sm5, 1)
         price_pos = get_price_position(price, pair)
+
+        # [v9.9.2-PM] Update pump memory SETELAH hard reject
+        # Token berbahaya (honeypot, dll) tidak masuk watchlist.
+        update_pump_memory(addr, mcap, h6, h1, age_h)
+
+        # [FIX] Single call check_watchlist_bounce (sebelumnya double call = bug state race)
+        is_watchlist_bounce = check_watchlist_bounce(addr, mcap, r_m5_val, price_pos, h1, h6, m5)
+
         if price_pos > F4_PEAK_POSITION:
-            # Pengecualian: jika dari watchlist bounce dengan buyer ratio sangat tinggi
-            # → tetap boleh lanjut (ini post-dump bounce legit)
-            is_watchlist = check_watchlist_bounce(addr, mcap, r_m5_val, price_pos)
-            if not is_watchlist:
+            # Pengecualian: jika dari watchlist bounce → tetap boleh lanjut
+            if not is_watchlist_bounce:
                 print(f"[F4 SKIP] {symbol} price position {price_pos:.2f} > {F4_PEAK_POSITION} "
                       f"— harga di puncak range h1")
                 return None
 
-        # ── [v9.9.2-PM] Watchlist bounce check ───────────
-        # Token dari watchlist yang menunjukkan akumulasi kuat
-        is_watchlist_bounce = check_watchlist_bounce(addr, mcap, r_m5_val, price_pos)
+        # ── [v9.9.2-PM] Watchlist bounce confirm ─────────
         if is_watchlist_bounce:
             print(f"[PM WATCHLIST] {symbol} bounce terdeteksi! "
                   f"MCAP ${mcap:,.0f} buyer {r_m5_val:.1f}x pos {price_pos:.2f}")
@@ -1175,14 +1302,19 @@ def analyze_pair(pair: dict) -> dict | None:
             p_score += 3
             p_sig.append(f"📉 Harga di dasar range ({price_pos:.0%}) — potensi reversal")
 
-        # [v9.9.2] Bonus score: dari watchlist bounce
+        # [v9.9.3] Bonus score: dari watchlist bounce (Birth Floor + Healthy Dump confirmed)
         if is_watchlist_bounce:
             mem = pump_memory.get(addr, {})
-            peak = mem.get("peak_mcap", 0)
+            peak        = mem.get("peak_mcap", 0)
+            birth_floor = mem.get("min_mcap_seen", 0)
+            dump_scans  = mem.get("dump_scan_count", 0)
             if peak > 0:
-                peak_str = f"${peak/1000:.0f}K"
+                peak_str  = f"${peak/1000:.0f}K"
+                floor_str = f"${birth_floor/1000:.0f}K" if birth_floor > 0 else "N/A"
+                floor_r   = mcap / birth_floor if birth_floor > 0 else 0
                 p_score += 5
-                p_sig.append(f"🎯 WATCHLIST BOUNCE! Pernah peak {peak_str}, akumulasi terdeteksi")
+                p_sig.append(f"🏠 BIRTH FLOOR BOUNCE! Peak {peak_str} → floor {floor_str} "
+                             f"(sekarang {floor_r:.1f}x, dump {dump_scans} scan bertahap)")
 
         # ── GATE 4: SAFETY SCORING (sekunder) ────────────
         s_score, s_sig, s_warn, safety_pct = score_safety(
@@ -1230,7 +1362,11 @@ def analyze_pair(pair: dict) -> dict | None:
             "chain": chain, "dex": dex, "pair_id": pair_id,
             "price": price, "pump_pct": round(pump_pct, 1),
             "dip_pct": round(dip_pct, 1), "open_c1": open_c1,
-            "holds_c1": price >= open_c1 * 0.9,
+            # [v9.9.2-FX3] holds_c1 display: token age < 1h → netral (True)
+            # Konsisten dengan score_prepump yang skip C1 check untuk token very fresh
+            "holds_c1": (True if age_h < 1.0
+                         else (price >= open_c1 * 0.9) if open_c1 > 0
+                         else True),
             "m5": m5, "h1": h1, "h6": h6, "h24": h24,
             "vm5": vm5, "vh1": vh1, "vh24": vh24,
             "bm5": bm5, "sm5": sm5, "bh1": bh1, "sh1": sh1, "txh24": txh24,
@@ -1299,7 +1435,7 @@ def format_alert(s: dict, is_update: bool = False) -> str:
     grade_emoji = {"A+":"💎","A":"🏆","B":"🥈"}.get(s["grade"],"")
 
     # [v9.9-9] Label UPDATE untuk alert token yang sama
-    alert_label = "🔄 UPDATE ALERT v9.9.2!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.2!"
+    alert_label = "🔄 UPDATE ALERT v9.9.3!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.3!"
     mode_lbl    = "🔥 PRE-PUMP MODE" if s["tier"] == "T0" else "📉 DIP &amp; RIP MODE"
 
     signals_text = "\n".join(s["signals"])  if s["signals"]  else "—"
@@ -1464,8 +1600,8 @@ def scan_once():
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v9.9.2 — CHART IS KING")
-    print("  Pattern primer, safety sekunder")
+    print("  DIP & RIP BOT v9.9.3 — CHART IS KING")
+    print("  Pattern primer | Birth Floor | Healthy Dump")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY else '⚠️ Belum ada key'}")
     print(f"  Lunar   : {'✅' if LUNARCRUSH_KEY else '⚠️ Belum ada key'}")
@@ -1477,19 +1613,17 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.9.2 aktif!</b>\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.9.3 aktif!</b>\n\n"
         "📊 <b>Arsitektur:</b>\n"
         "   1️⃣ Chart pattern → primer\n"
         "   2️⃣ Filter F1/F2/F3 → evidence-based\n"
         "   3️⃣ Price Position F4 → anti spike\n"
         "   4️⃣ Hard reject → bahaya konkrit\n"
         "   5️⃣ Safety data → confidence booster\n\n"
-        "🆕 <b>Fitur baru v9.9.2:</b>\n"
-        "   [F4] Price position >85% range → SKIP\n"
-        "   [PM] Pump Memory Watchlist aktif\n"
-        "   [FX1] T0 MCAP threshold: $85K → $80K\n"
-        "   [FX2] Age resolution fix (bug BBQ)\n"
-        "   [FX3] Hold C1 skip jika age &lt; 1h\n\n"
+        "🆕 <b>Fitur baru v9.9.3:</b>\n"
+        "   [BF] Birth Floor tracking aktif\n"
+        "   [HD] Healthy Dump filter (proxy + scan)\n"
+        "   [PM3] PM Watchlist v3: Floor Ratio check\n\n"
         "🚨 Scan setiap 30 detik!"
     )
 
