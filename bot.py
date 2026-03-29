@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v9.9.1 — CHART IS KING
+#   DIP & RIP BOT v9.9.2 — CHART IS KING
 #   Core Philosophy: Chart Dulu, Data Pendukung Kemudian
 #
 #   ARSITEKTUR BARU:
@@ -60,6 +60,23 @@ from pathlib import Path
 #               Token age N/A: ×0.4 | <0.5h: ×0.3 | <1h: ×0.5
 #               Evidence: 5/5 token Batch 4 loss karena late MCAP.
 #               Filter dipasang SEBELUM API calls → hemat resources.
+#
+#   CHANGELOG v9.9.2 (29 Mar 2026):
+#   [v9.9.2-F4] PRICE POSITION AWARENESS: filter baru setelah API
+#               calls. Hitung posisi harga dalam range h1 (high/low).
+#               Jika harga sudah di >85% puncak range → SKIP.
+#               Evidence: bot reaktif tidak bisa beda spike vs akumulasi.
+#   [v9.9.2-PM] PUMP MEMORY WATCHLIST: bot catat token yang pernah
+#               pump >150% MCAP. Setelah dump >65% dari peak, token
+#               masuk watchlist. Alert khusus saat buyer_ratio >10x
+#               + price_position rendah = akumulasi terdeteksi.
+#   [v9.9.2-FX1] F3 threshold T0: $85K → $80K.
+#               Evidence: MCAP $80-85K win rate hanya 11% dari dataset.
+#   [v9.9.2-FX2] Age resolution: resolve age SEBELUM F3 menggunakan
+#               min(GMGN age, DexScreener fallback) untuk konsistensi.
+#               Fix bug BBQ (age 0.6h tidak tertangkap F3).
+#   [v9.9.2-FX3] Hold C1: skip check jika token age < 1h.
+#               Evidence: WON (0.5h, Hold C1 TIDAK) → 3.8x.
 # ══════════════════════════════════════════════════════════
 
 # ── CONFIG ──────────────────────────────────────────────
@@ -96,7 +113,9 @@ def save_state():
             json.dump({
                 "price_tracker":  clean_prices,
                 "alerted_tokens": {k: v for k, v in alerted_tokens.items()
-                                   if now - v < 86400}
+                                   if now - v < 86400},
+                "pump_memory":    {k: v for k, v in pump_memory.items()
+                                   if now - v.get("peak_ts", 0) < 7 * 86400}
             }, f)
     except Exception as e:
         print(f"[STATE ERR] save: {e}")
@@ -104,6 +123,7 @@ def save_state():
 _state         = load_state()
 alerted_tokens = _state.get("alerted_tokens", {})
 price_tracker  = _state.get("price_tracker", {})
+pump_memory    = _state.get("pump_memory", {})   # [v9.9.2-PM]
 
 # ── TIER PARAMETERS ─────────────────────────────────────
 T0_MIN_MCAP      = 25_000
@@ -169,6 +189,18 @@ RUGCHECK_DANGEROUS_RISKS   = {"copycat", "honeypot", "freeze", "blacklist", "rug
 SCAN_INTERVAL_SEC       = 30
 ALERT_COOLDOWN_SEC      = 300
 UPDATE_LABEL_WINDOW_SEC = 900  # [v9.9-9] 15 menit = label UPDATE
+
+# ── [v9.9.2] PRICE POSITION & PUMP MEMORY CONSTANTS ─────
+# [F4] Price Position Awareness
+F4_PEAK_POSITION        = 0.85   # Harga di >85% dari range h1 → SKIP
+F4_BASE_POSITION_BONUS  = 0.30   # Harga di <30% dari range → bonus score +3
+
+# [PM] Pump Memory Watchlist
+PM_PUMP_THRESHOLD       = 150.0  # h6 atau h1 > 150% → catat sebagai pump besar
+PM_DUMP_THRESHOLD       = 0.35   # current_mcap < peak * 0.35 = dump >65% → watchlist aktif
+PM_BUYER_RATIO_MIN      = 10.0   # buyer_ratio_m5 minimum untuk trigger watchlist alert
+PM_POSITION_MAX         = 0.25   # price_position harus < 25% dari range (di dasar)
+PM_WATCHLIST_COOLDOWN   = 3600   # 1 jam cooldown antar watchlist alert
 
 # ── CACHE ────────────────────────────────────────────────
 gmgn_cache     = {}
@@ -747,7 +779,11 @@ def score_prepump(price: float, open_c1: float,
         score += 1; signals.append(f"🆕 Token fresh: {age_h:.1f}h")
 
     # C1 — toleransi 10% untuk konsistensi dengan holds_c1
-    if open_c1 > 0 and price >= open_c1 * 0.9:
+    # [v9.9.2-FX3] Skip Hold C1 check jika token < 1h
+    # Evidence: WON (0.5h, Hold C1 TIDAK) → 3.8x. C1 belum establish di token sangat fresh.
+    if age_h < 1.0:
+        pass  # tidak cek C1, token terlalu fresh untuk C1 yang valid
+    elif open_c1 > 0 and price >= open_c1 * 0.9:
         above_pct = ((price - open_c1) / open_c1 * 100)
         score += 2; signals.append(f"✅ Harga di atas C1 (+{above_pct:.0f}%)")
     elif open_c1 > 0:
@@ -884,6 +920,110 @@ def get_sl_tp(price: float, tier: str) -> tuple:
             price * tp2_map.get(tier, 3.0),
             int((1 - sl_pct) * 100))
 
+# ── [v9.9.2-PM] PUMP MEMORY FUNCTIONS ───────────────────
+def update_pump_memory(addr: str, mcap: float, h6: float, h1: float):
+    """
+    Catat token yang pernah pump besar.
+    Dipanggil setiap kali token lolos pattern check.
+    """
+    global pump_memory
+    pump_pct = max(h6, h1)
+    if pump_pct >= PM_PUMP_THRESHOLD:
+        existing = pump_memory.get(addr, {})
+        if mcap > existing.get("peak_mcap", 0):
+            pump_memory[addr] = {
+                "peak_mcap": mcap,
+                "peak_ts":   time.time(),
+                "birth_mcap": existing.get("birth_mcap", mcap),
+                "status":    "watching",
+                "last_alert": existing.get("last_alert", 0),
+            }
+            print(f"[PM] {addr[:8]} dicatat peak ${mcap:,.0f} (pump {pump_pct:.0f}%)")
+
+def check_watchlist_bounce(addr: str, mcap: float,
+                           buyer_ratio_m5: float,
+                           price_position: float) -> bool:
+    """
+    Cek apakah token dari watchlist menunjukkan sinyal bounce.
+    Returns True jika kondisi terpenuhi dan cooldown habis.
+    """
+    mem = pump_memory.get(addr)
+    if not mem:
+        return False
+    peak = mem.get("peak_mcap", 0)
+    if peak <= 0:
+        return False
+
+    # Harus sudah dump >65% dari peak
+    if mcap > peak * PM_DUMP_THRESHOLD:
+        return False
+
+    # Buyer ratio dan price position harus memenuhi syarat
+    if buyer_ratio_m5 < PM_BUYER_RATIO_MIN:
+        return False
+    if price_position > PM_POSITION_MAX:
+        return False
+
+    # Cooldown check
+    last = mem.get("last_alert", 0)
+    if time.time() - last < PM_WATCHLIST_COOLDOWN:
+        return False
+
+    return True
+
+def mark_watchlist_alerted(addr: str):
+    """Update timestamp last alert di pump memory."""
+    if addr in pump_memory:
+        pump_memory[addr]["last_alert"] = time.time()
+        pump_memory[addr]["status"]     = "alerted"
+
+# ── [v9.9.2-F4] PRICE POSITION FUNCTION ─────────────────
+def get_price_position(price: float, pair: dict) -> float:
+    """
+    Estimasi posisi harga dalam range 1 jam.
+    0.0 = di dasar range (potensi naik)
+    1.0 = di puncak range (sudah terlambat)
+
+    Logic:
+    - Gunakan h1 untuk estimasi range low/high
+    - Gunakan m5 untuk tahu apakah harga masih di puncak atau sudah turun
+    - Jika m5 < 0 setelah h1 positif → harga sudah turun dari puncak
+    - Jika m5 > 0 dan h1 > 0 → masih di puncak = position tinggi
+    """
+    try:
+        pc  = pair.get("priceChange", {})
+        h1  = float(pc.get("h1", 0) or 0)
+        m5  = float(pc.get("m5", 0) or 0)
+
+        if h1 > 0:
+            # Token pumped dalam 1 jam terakhir
+            estimated_low = price / (1 + h1 / 100)  # harga 1 jam lalu
+
+            if m5 < 0:
+                # Harga sudah turun dari puncak — estimasi peak lebih tinggi dari sekarang
+                # peak = price sebelum m5 negatif terjadi
+                estimated_peak = price / (1 + m5 / 100)
+            else:
+                # Masih naik atau flat — sekarang = peak
+                estimated_peak = price
+
+        else:
+            # Token dump dalam 1 jam — harga 1 jam lalu lebih tinggi
+            estimated_peak = price / (1 + h1 / 100)  # harga 1 jam lalu (lebih tinggi)
+            estimated_low  = price                    # sekarang = dasar
+
+        range_size = estimated_peak - estimated_low
+        if range_size <= 0:
+            return 0.5  # tidak bisa hitung, anggap tengah
+
+        position = (price - estimated_low) / range_size
+        return round(max(0.0, min(1.0, position)), 3)
+
+    except Exception as e:
+        print(f"[F4 ERR] {e}")
+        return -1.0  # tidak tersedia
+
+
 # ── MAIN ANALYZE ─────────────────────────────────────────
 def analyze_pair(pair: dict) -> dict | None:
     try:
@@ -960,8 +1100,12 @@ def analyze_pair(pair: dict) -> dict | None:
         # Entry terlalu jauh dari kelahiran token = harga sudah naik duluan.
         # Threshold makin ketat untuk token lebih muda (age bands).
         # Dataset: 5/5 token Batch 4 loss karena MCAP terlalu tinggi saat alert.
-        _f3_threshold = {"T0": 85_000, "T1": 200_000,
-                         "T2": 700_000, "T3": 2_500_000}.get(tier, 85_000)
+        # [v9.9.2-FX1] T0 turun dari $85K → $80K
+        # Evidence: MCAP $80-85K win rate 11%, MCAP $60-80K win rate 67%
+        # [v9.9.2-FX2] Gunakan age_h_fallback (DexScreener) secara konsisten
+        # Ini fix bug BBQ: GMGN bilang 0.6h tapi DexScreener > 1h → F3 tidak trigger
+        _f3_threshold = {"T0": 80_000, "T1": 200_000,
+                         "T2": 700_000, "T3": 2_500_000}.get(tier, 80_000)
         if age_h_fallback == 0:       _f3_threshold *= 0.40  # N/A = unknown = paling konservatif
         elif age_h_fallback < 0.5:    _f3_threshold *= 0.30  # < 30 menit
         elif age_h_fallback < 1.0:    _f3_threshold *= 0.50  # 30–60 menit
@@ -970,6 +1114,11 @@ def analyze_pair(pair: dict) -> dict | None:
             print(f"[F3 SKIP] {symbol} MCAP ${mcap:,.0f} > ${_f3_threshold:,.0f} "
                   f"(tier {tier}, age {age_h_fallback:.1f}h) — late entry")
             return None
+
+        # [v9.9.2-PM] Update pump memory SEBELUM API calls
+        # Catat setiap token dengan pump besar agar bisa dideteksi saat bounce
+        update_pump_memory(addr, mcap, h6, h1)
+
         gmgn_data     = get_gmgn(addr)
         helius_data   = get_helius(addr)
         rugcheck_data = get_rugcheck(addr)
@@ -986,6 +1135,29 @@ def analyze_pair(pair: dict) -> dict | None:
             if reason: print(f"[HARD REJECT] {symbol} — {reason}")
             return None
 
+        # ── [v9.9.2-F4] GATE 3.5: PRICE POSITION CHECK ───
+        # Hitung posisi harga dalam range h1.
+        # Jika harga sudah di >85% dari puncak range → terlambat
+        # Evidence: bot tidak bisa bedakan spike vs akumulasi tanpa ini
+        r_m5_val = bm5 / max(sm5, 1)
+        price_pos = get_price_position(price, pair)
+        if price_pos > F4_PEAK_POSITION:
+            # Pengecualian: jika dari watchlist bounce dengan buyer ratio sangat tinggi
+            # → tetap boleh lanjut (ini post-dump bounce legit)
+            is_watchlist = check_watchlist_bounce(addr, mcap, r_m5_val, price_pos)
+            if not is_watchlist:
+                print(f"[F4 SKIP] {symbol} price position {price_pos:.2f} > {F4_PEAK_POSITION} "
+                      f"— harga di puncak range h1")
+                return None
+
+        # ── [v9.9.2-PM] Watchlist bounce check ───────────
+        # Token dari watchlist yang menunjukkan akumulasi kuat
+        is_watchlist_bounce = check_watchlist_bounce(addr, mcap, r_m5_val, price_pos)
+        if is_watchlist_bounce:
+            print(f"[PM WATCHLIST] {symbol} bounce terdeteksi! "
+                  f"MCAP ${mcap:,.0f} buyer {r_m5_val:.1f}x pos {price_pos:.2f}")
+            mark_watchlist_alerted(addr)
+
         # ── GATE 4: PATTERN SCORING (primer) ─────────────
         if tier == "T0":
             p_score, p_sig, p_warn, dip_pct = score_prepump(
@@ -997,6 +1169,20 @@ def analyze_pair(pair: dict) -> dict | None:
                 price, open_c1, m5, h1, h6, h24,
                 vm5, vh1, vh6, bm5, sm5, bh1, sh1, tracked_high)
             pump_pct = h24 if h24 >= MIN_PUMP_PCT else h6
+
+        # [v9.9.2] Bonus score: harga di dasar range (potensi naik)
+        if 0 <= price_pos <= F4_BASE_POSITION_BONUS:
+            p_score += 3
+            p_sig.append(f"📉 Harga di dasar range ({price_pos:.0%}) — potensi reversal")
+
+        # [v9.9.2] Bonus score: dari watchlist bounce
+        if is_watchlist_bounce:
+            mem = pump_memory.get(addr, {})
+            peak = mem.get("peak_mcap", 0)
+            if peak > 0:
+                peak_str = f"${peak/1000:.0f}K"
+                p_score += 5
+                p_sig.append(f"🎯 WATCHLIST BOUNCE! Pernah peak {peak_str}, akumulasi terdeteksi")
 
         # ── GATE 4: SAFETY SCORING (sekunder) ────────────
         s_score, s_sig, s_warn, safety_pct = score_safety(
@@ -1113,7 +1299,7 @@ def format_alert(s: dict, is_update: bool = False) -> str:
     grade_emoji = {"A+":"💎","A":"🏆","B":"🥈"}.get(s["grade"],"")
 
     # [v9.9-9] Label UPDATE untuk alert token yang sama
-    alert_label = "🔄 UPDATE ALERT v9.9.1!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.1!"
+    alert_label = "🔄 UPDATE ALERT v9.9.2!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.2!"
     mode_lbl    = "🔥 PRE-PUMP MODE" if s["tier"] == "T0" else "📉 DIP &amp; RIP MODE"
 
     signals_text = "\n".join(s["signals"])  if s["signals"]  else "—"
@@ -1278,7 +1464,7 @@ def scan_once():
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v9.9.1 — CHART IS KING")
+    print("  DIP & RIP BOT v9.9.2 — CHART IS KING")
     print("  Pattern primer, safety sekunder")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY else '⚠️ Belum ada key'}")
@@ -1291,17 +1477,19 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.9.1 aktif!</b>\n\n"
-        "🔑 <b>Filosofi: Chart adalah keputusan</b>\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.9.2 aktif!</b>\n\n"
         "📊 <b>Arsitektur:</b>\n"
         "   1️⃣ Chart pattern → primer\n"
-        "   2️⃣ Early exit filters v9.9.1 → evidence-based\n"
-        "   3️⃣ Hard reject → bahaya konkrit saja\n"
-        "   4️⃣ Safety data → confidence booster\n\n"
-        "🆕 <b>Filter baru v9.9.1 (dari 29 token dataset):</b>\n"
-        "   [F1] m5 > 150% → SKIP (spike too late)\n"
-        "   [F2] h1 &lt; -30% + no Hold C1 → SKIP (peaked)\n"
-        "   [F3] MCAP > threshold tier → SKIP (late entry)\n\n"
+        "   2️⃣ Filter F1/F2/F3 → evidence-based\n"
+        "   3️⃣ Price Position F4 → anti spike\n"
+        "   4️⃣ Hard reject → bahaya konkrit\n"
+        "   5️⃣ Safety data → confidence booster\n\n"
+        "🆕 <b>Fitur baru v9.9.2:</b>\n"
+        "   [F4] Price position >85% range → SKIP\n"
+        "   [PM] Pump Memory Watchlist aktif\n"
+        "   [FX1] T0 MCAP threshold: $85K → $80K\n"
+        "   [FX2] Age resolution fix (bug BBQ)\n"
+        "   [FX3] Hold C1 skip jika age &lt; 1h\n\n"
         "🚨 Scan setiap 30 detik!"
     )
 
