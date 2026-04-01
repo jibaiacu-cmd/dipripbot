@@ -6,84 +6,15 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v9.9.3 — CHART IS KING
+#   DIP & RIP BOT v9.9.4 — CHART IS KING
 #   Core Philosophy: Chart Dulu, Data Pendukung Kemudian
 #
-#   ARSITEKTUR BARU:
-#   [1] Filter dasar (harga, mcap, tier)
-#   [2] PATTERN CHECK — PRIMER (dari DexScreener saja)
-#       Chart tidak bisa bohong. Jika tidak ada pattern → skip.
-#   [3] HARD REJECT — hanya untuk bahaya yang TERBUKTI:
-#       Honeypot, Mint/Freeze Authority, Copycat/risk kritis,
-#       Top10 > 70%, Hub&Spoke untuk T1/T2/T3
-#   [4] SAFETY SCORING — SEKUNDER (menambah/mengurangi keyakinan)
-#       Data ada = ±score. Data tidak ada = 0 (netral, bukan reject).
-#   [5] Grade B minimum → alert dikirim
-#
-#   FILOSOFI:
-#   Data luar chart (GMGN/Rugcheck/Helius) adalah "confidence booster"
-#   atau "danger flag". Chart yang memutuskan. Token dengan chart kuat
-#   tetap dipertimbangkan meski data luar kosong.
-#
-#   CHANGELOG v9.9 (26 Mar 2026):
-#   [v9.9-1] ARSITEKTUR: Pattern check SEBELUM API calls external.
-#            Jika chart tidak ada pattern → langsung skip tanpa
-#            membuang waktu call GMGN/Rugcheck/Helius.
-#   [v9.9-2] HARD REJECT: hanya untuk bahaya konkrit. Dihapus:
-#            - T1/T2/T3 wajib GMGN (data absen ≠ token bahaya)
-#            - T0 Rugcheck ≥ 60 (skor rendah ≠ token jelek)
-#   [v9.9-3] Hub & Spoke: T0 = -5 score (bukan reject). Token
-#            ultra-early wajar belum punya distribusi merata.
-#            T1/T2/T3 = tetap hard reject.
-#   [v9.9-4] Named risks hard reject: "copycat", "freeze authority",
-#            "honeypot" dalam daftar risks Rugcheck = reject langsung.
-#   [v9.9-5] Top10 > 70% = hard reject. Di atas ini 10 wallet
-#            memegang hampir seluruh supply = ekstrem berbahaya.
-#   [v9.9-6] Safety scoring netral saat data kosong (0, bukan penalti).
-#            GMGN tidak ada = pattern score saja yang menentukan.
-#   [v9.9-7] Sniper count dikembalikan dari v8.0 — sinyal manipulasi
-#            awal yang relevan.
-#   [v9.9-8] Safety score bar visual (0–100) dikembalikan dari v9.0.
-#   [v9.9-9] Dual alert: token yang sama dalam 15 menit berlabel
-#            🔄 UPDATE bukan alert baru.
-#   [CARRIED] Semua fix v9.6–v9.8 tetap aktif.
-#
-#   CHANGELOG v9.9.1 (28 Mar 2026):
-#   [v9.9.1-F1] SPIKE TOO LATE: m5 > 150% → skip langsung.
-#               Evidence: pisscoin +262%→1x, Dojo +323%→2x.
-#               Win rate 0% di atas threshold ini (3 kasus).
-#   [v9.9.1-F2] ALREADY PEAKED: h1 < -30% + Hold C1 TIDAK → skip.
-#               Evidence: USD, GAMEOVER, Mythos semua <1.2x.
-#               Konfirmasi distribusi aktif sebelum alert masuk.
-#   [v9.9.1-F3] MCAP LATE ENTRY: MCAP > threshold tier → skip.
-#               T0 max $85K, dengan pengurangan untuk token muda.
-#               Token age N/A: ×0.4 | <0.5h: ×0.3 | <1h: ×0.5
-#               Evidence: 5/5 token Batch 4 loss karena late MCAP.
-#               Filter dipasang SEBELUM API calls → hemat resources.
-#
-#   CHANGELOG v9.9.2 (29 Mar 2026):
-#   [v9.9.2-F4] PRICE POSITION AWARENESS: filter baru setelah API
-#               calls. Hitung posisi harga dalam range h1 (high/low).
-#               Jika harga sudah di >85% puncak range → SKIP.
-#               Evidence: bot reaktif tidak bisa beda spike vs akumulasi.
-#   [v9.9.2-PM] PUMP MEMORY WATCHLIST: bot catat token yang pernah
-#               pump >150% MCAP. Setelah dump >65% dari peak, token
-#               masuk watchlist. Alert khusus saat buyer_ratio >10x
-#               + price_position rendah = akumulasi terdeteksi.
-#   [v9.9.2-FX1] F3 threshold T0: $85K → $80K.
-#               Evidence: MCAP $80-85K win rate hanya 11% dari dataset.
-#   [v9.9.2-FX2] Age resolution: resolve age SEBELUM F3 menggunakan
-#               min(GMGN age, DexScreener fallback) untuk konsistensi.
-#               Fix bug BBQ (age 0.6h tidak tertangkap F3).
-#   [v9.9.2-FX3] Hold C1: skip check jika token age < 1h.
-#               Evidence: WON (0.5h, Hold C1 TIDAK) → 3.8x.
-#               Display holds_c1 juga neutral (True) untuk age < 1h.
-#   [v9.9.2-FIX1] Pump Memory: update_pump_memory SETELAH hard reject.
-#               Token honeypot tidak masuk watchlist bounce.
-#   [v9.9.2-FIX2] Single call check_watchlist_bounce (eliminasi
-#               double call yang berpotensi state race condition).
-#   [v9.9.2-FIX3] age_h_fallback di-clamp >= 0 (guard timestamp
-#               masa depan dari API yang bermasalah).
+#   CHANGELOG v9.9.4 (PATCHED):
+#   [FIX-1] F3 Paradox: Clamp F3 threshold agar tidak < MIN_MCAP tier
+#   [FIX-2] Race Condition PM: Cek watchlist_bounce SEBELUM update_memory
+#   [FIX-3] Volume Hallucination: avg5m disesuaikan dengan umur token (active_m5)
+#   [FIX-4] Helius LP Ignore: Abaikan pemegang >50% (Raydium LP) untuk Hub&Spoke
+#   [FIX-5] Healthy Dump Range: Tolak m5 > 10% (V-shape terlambat)
 # ══════════════════════════════════════════════════════════
 
 # ── CONFIG ──────────────────────────────────────────────
@@ -130,7 +61,7 @@ def save_state():
 _state         = load_state()
 alerted_tokens = _state.get("alerted_tokens", {})
 price_tracker  = _state.get("price_tracker", {})
-pump_memory    = _state.get("pump_memory", {})   # [v9.9.2-PM]
+pump_memory    = _state.get("pump_memory", {})
 
 # ── TIER PARAMETERS ─────────────────────────────────────
 T0_MIN_MCAP      = 25_000
@@ -165,7 +96,6 @@ MAX_DIP_PCT     = 70
 MIN_M5_SIGNAL   = 3.0
 MAX_CANDLE_DROP = 25
 
-# T0 enhancement
 LIQ_MCAP_RATIO_MIN  = 0.15
 LIQ_MCAP_RATIO_GOOD = 0.30
 VOL_SPIKE_EXTREME   = 10.0
@@ -179,7 +109,7 @@ MIN_LP_BURNED_T2        = 20.0
 MAX_BUNDLE_PCT          = 10.0
 MAX_DEV_BURNED_PCT_WARN = 20.0
 MAX_TOP10_PCT           = 30.0
-HARD_REJECT_TOP10       = 70.0   # [v9.9-5] > 70% = reject
+HARD_REJECT_TOP10       = 70.0
 MIN_TOKEN_AGE_T0        = 0.1
 MIN_TOKEN_AGE_T1        = 0.5
 MIN_TOKEN_AGE_T2        = 0.5
@@ -190,34 +120,29 @@ HELIUS_MAX_TOP10        = 30.0
 
 RUGCHECK_MAX_RISKS         = 2
 RUGCHECK_HARD_REJECT_RISKS = 5
-# [v9.9-4] Nama risk dari Rugcheck yang langsung hard reject
 RUGCHECK_DANGEROUS_RISKS   = {"copycat", "honeypot", "freeze", "blacklist", "rugpull"}
 
 SCAN_INTERVAL_SEC       = 30
 ALERT_COOLDOWN_SEC      = 300
-UPDATE_LABEL_WINDOW_SEC = 900  # [v9.9-9] 15 menit = label UPDATE
+UPDATE_LABEL_WINDOW_SEC = 900
 
-# ── [v9.9.2] PRICE POSITION & PUMP MEMORY CONSTANTS ─────
-# [F4] Price Position Awareness
-F4_PEAK_POSITION        = 0.85   # Harga di >85% dari range h1 → SKIP
-F4_BASE_POSITION_BONUS  = 0.30   # Harga di <30% dari range → bonus score +3
+# ── PRICE POSITION & PUMP MEMORY CONSTANTS ──────────────
+F4_PEAK_POSITION        = 0.85
+F4_BASE_POSITION_BONUS  = 0.30
 
-# [PM] Pump Memory Watchlist — v9.9.3 constants
-PM_PUMP_THRESHOLD       = 150.0  # h6 atau h1 > 150% → catat sebagai pump besar
-PM_BUYER_RATIO_MIN      = 10.0   # buyer_ratio_m5 minimum untuk trigger watchlist alert
-PM_POSITION_MAX         = 0.25   # price_position harus < 25% dari range (di dasar)
-PM_WATCHLIST_COOLDOWN   = 3600   # 1 jam cooldown antar watchlist alert
+PM_PUMP_THRESHOLD       = 150.0
+PM_BUYER_RATIO_MIN      = 10.0
+PM_POSITION_MAX         = 0.25
+PM_WATCHLIST_COOLDOWN   = 3600
 
-# [v9.9.3-BF] Birth Floor constants
-PM_BIRTH_FLOOR_RATIO_MIN = 1.00  # MCAP minimal 1.0x dari birth floor (tidak di bawah)
-PM_BIRTH_FLOOR_RATIO_MAX = 1.80  # MCAP maksimal 1.8x dari birth floor (masih dekat)
-PM_BIRTH_PEAK_MIN_RATIO  = 3.0   # Peak minimal 3x dari birth floor (pump signifikan)
-PM_FLOOR_UNCERTAIN_AGE   = 6.0   # Token > 6h saat pertama terdeteksi → floor tidak reliable
+PM_BIRTH_FLOOR_RATIO_MIN = 1.00
+PM_BIRTH_FLOOR_RATIO_MAX = 1.80
+PM_BIRTH_PEAK_MIN_RATIO  = 3.0
+PM_FLOOR_UNCERTAIN_AGE   = 6.0
 
-# [v9.9.3-HD] Healthy Dump constants
-PM_HD_H1_H6_MAX_RATIO    = 0.70  # h1_magnitude max 70% dari h6_magnitude
-PM_HD_M5_MAX_DUMP        = -15.0 # m5 tidak boleh < -15% (dump masih aktif)
-PM_HD_MIN_SCAN_COUNT     = 6     # Minimal 6 scan bertahap (3 menit) untuk dump sehat
+PM_HD_H1_H6_MAX_RATIO    = 0.70
+PM_HD_M5_MAX_DUMP        = -15.0
+PM_HD_MIN_SCAN_COUNT     = 6
 
 # ── CACHE ────────────────────────────────────────────────
 gmgn_cache     = {}
@@ -324,7 +249,6 @@ def get_gmgn(token_address: str) -> dict:
                 raw_bnd = float(token.get("bundle_pct", 0) or 0) * 100
                 raw_dev = float(token.get("dev_token_burn_ratio", 0) or 0) * 100
 
-                # Guard nilai melebihi 100% — deteksi perubahan API
                 if raw_lp > 100 or raw_bnd > 100 or raw_dev > 100:
                     print(f"[GMGN WARN] {token_address[:8]} nilai >100% — "
                           f"LP:{raw_lp:.0f}% Bnd:{raw_bnd:.0f}% Dev:{raw_dev:.0f}%")
@@ -336,7 +260,6 @@ def get_gmgn(token_address: str) -> dict:
                     "lp_burned":     min(raw_lp, 100.0),
                     "bundle_pct":    min(raw_bnd, 100.0),
                     "dev_burned_pct":min(raw_dev, 100.0),
-                    # [v9.9-7] sniper_count dikembalikan dari v8.0
                     "sniper_count":  token.get("sniper_count", 0) or 0,
                     "is_honeypot":   token.get("is_honeypot", False),
                     "rug_ratio":     float(token.get("rug_ratio", 0) or 0),
@@ -436,8 +359,17 @@ def get_helius(token_address: str) -> dict:
                      if float(a.get("uiAmount", 0) or 0) > 0]
         top10_pct = (sum(balances[:10]) / total * 100
                      if len(balances) >= 10 else sum(balances) / total * 100)
-        hub_spoke = (len(balances) >= 2 and balances[1] > 0
-                     and balances[0] / balances[1] > 5)
+                     
+        # [FIX-4] Helius Hub & Spoke LP Ignore
+        if len(balances) >= 3:
+            if balances[0] / total > 0.5:
+                hub_spoke = (balances[2] > 0 and balances[1] / balances[2] > 5)
+            else:
+                hub_spoke = (balances[1] > 0 and balances[0] / balances[1] > 5)
+        elif len(balances) == 2:
+            hub_spoke = (balances[1] > 0 and balances[0] / balances[1] > 5)
+        else:
+            hub_spoke = False
 
         result = {
             "available": True,
@@ -517,14 +449,15 @@ def calc_dip_from_high(price: float, tracked_high: float,
         return abs(change_m5)
     return 0.0
 
-# ── [v9.9-1/2] PATTERN CHECK — PRIMER ────────────────────
-# Dipanggil SEBELUM API calls external. Jika tidak ada pattern,
-# tidak perlu buang waktu call GMGN/Rugcheck/Helius.
+# ── PATTERN CHECK — PRIMER ───────────────────────────────
 def check_pattern_exists(tier: str, m5: float, h1: float, h6: float,
-                         h24: float, vm5: float, vh1: float) -> bool:
+                         h24: float, vm5: float, vh1: float, age_h: float) -> bool:
     """Gate cepat: apakah token layak diproses lebih lanjut?"""
+    # [FIX-3] Volume Spike Hallucination pada Token Baru
+    active_m5 = max(1, min(12, int(age_h * 60 / 5))) if age_h > 0 else 1
+    avg5m = vm5 if active_m5 <= 1 else (vh1 / active_m5 if vh1 > 0 else 0)
+
     if tier == "T0":
-        avg5m         = vh1 / 12 if vh1 > 0 else 0
         has_vol_spike = avg5m > 0 and vm5 / avg5m >= 2.0
         has_momentum  = h6 >= T0_MIN_PUMP_PCT or h1 >= 15 or has_vol_spike
         if not has_momentum:          return False
@@ -536,19 +469,12 @@ def check_pattern_exists(tier: str, m5: float, h1: float, h6: float,
         has_signal = (h1 < -10) or (m5 < -5) or (h6 > 20 and m5 >= 0)
         if not has_signal:            return False
         if m5 < -MAX_CANDLE_DROP:     return False
-        avg5m = vh1 / 12 if vh1 > 0 else 0
         if avg5m > 0 and vm5 / avg5m < 0.05: return False
         return True
 
-# ── [v9.9-2/4/5] HARD REJECT — BAHAYA KONKRIT SAJA ───────
+# ── HARD REJECT — BAHAYA KONKRIT SAJA ────────────────────
 def check_hard_reject(gmgn: dict, rugcheck: dict,
                       helius: dict, tier: str) -> tuple:
-    """
-    Returns (rejected: bool, reason: str)
-    Hanya menolak jika ada bukti nyata bahaya.
-    Data tidak tersedia BUKAN alasan reject.
-    """
-    # Rugcheck: bahaya terbukti
     if rugcheck.get("available"):
         if rugcheck.get("mint_auth"):
             return True, "🔴 MINT AUTHORITY — dev bisa cetak token!"
@@ -556,30 +482,24 @@ def check_hard_reject(gmgn: dict, rugcheck: dict,
             return True, "🔴 FREEZE AUTHORITY — dev bisa freeze wallet!"
         if rugcheck.get("risk_count", 0) > RUGCHECK_HARD_REJECT_RISKS:
             return True, f"🔴 Rugcheck: {rugcheck['risk_count']} risiko!"
-        # [v9.9-4] Named risks berbahaya
         risk_lower = rugcheck.get("risk_names_lower", [])
         for dangerous in RUGCHECK_DANGEROUS_RISKS:
             for r in risk_lower:
                 if dangerous in r:
                     return True, f"🔴 Rugcheck: '{r}' terdeteksi!"
 
-    # GMGN: bahaya terbukti
     if gmgn.get("is_honeypot"):
         return True, "🔴 HONEYPOT!"
     if gmgn.get("rug_ratio", 0) > 0.8:
         return True, "🔴 RUG RATIO TINGGI!"
 
-    # Helius: konsentrasi ekstrem
     if helius.get("available"):
         top10 = helius.get("top10_pct", 0)
-        # [v9.9-5] Top10 > 70% = hard reject
         if top10 > HARD_REJECT_TOP10:
             return True, f"🔴 Top 10 ekstrem: {top10:.0f}% — 10 wallet kuasai supply!"
-        # [v9.9-3] Hub & Spoke: T1+ = reject, T0 = penalti score saja
         if helius.get("hub_spoke") and tier in ["T1", "T2", "T3"]:
             return True, "🔴 Hub & Spoke pada token established!"
 
-    # Per-tier minimum dari GMGN (hanya jika tersedia)
     if gmgn.get("available"):
         age = gmgn.get("age_hours", 0)
         holders = gmgn.get("holders", 0)
@@ -599,18 +519,11 @@ def check_hard_reject(gmgn: dict, rugcheck: dict,
     return False, ""
 
 # ── SAFETY SCORING — SEKUNDER ────────────────────────────
-def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
-                 tier: str) -> tuple:
-    """
-    [v9.9-6] Data tidak ada = 0 (netral). Bukan penalti.
-    Safety hanya menambah atau mengurangi keyakinan.
-    Returns: (score, signals, warnings, safety_pct)
-    """
+def score_safety(gmgn: dict, rugcheck: dict, helius: dict, tier: str) -> tuple:
     score    = 0
     signals  = []
     warnings = []
 
-    # ── GMGN scoring ─────────────────────────────────────
     if gmgn.get("available"):
         lp  = gmgn.get("lp_burned", 0)
         bnd = gmgn.get("bundle_pct", 0)
@@ -620,7 +533,6 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
         sm_buy  = gmgn.get("smart_buy", 0)
         sm_sell = gmgn.get("smart_sell", 0)
 
-        # LP Burned
         if lp >= 100:
             score += 8; signals.append("🔒 LP Burned 100% — tidak bisa rug!")
         elif lp >= 80:
@@ -635,7 +547,6 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
             else:
                 warnings.append("⚠️ LP belum diburn (wajar token sangat baru)")
 
-        # Bundle
         if bnd <= 2:
             score += 5; signals.append(f"✅ Bundle {bnd:.1f}% — sangat bersih!")
         elif bnd <= MAX_BUNDLE_PCT:
@@ -645,7 +556,6 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
         else:
             score -= 4; warnings.append(f"🔴 Bundle tinggi {bnd:.1f}%!")
 
-        # Dev Burned (tinggi = bagus)
         if dev is not None:
             if dev >= 80:
                 score += 4; signals.append(f"✅ Dev burned {dev:.0f}% — komitmen!")
@@ -661,7 +571,6 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
                 else:
                     warnings.append("⚠️ Dev belum burn (umum token baru)")
 
-        # Holders
         if holders >= 2000:
             score += 3; signals.append(f"✅ Holders {holders:,}")
         elif holders >= 500:
@@ -669,7 +578,6 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
         elif holders >= 100:
             score += 1
 
-        # [v9.9-7] Sniper count
         if sniper == 0:
             score += 2; signals.append("✅ Tidak ada sniper")
         elif sniper <= 3:
@@ -679,14 +587,12 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
         else:
             score -= 2; warnings.append(f"🔴 Banyak sniper: {sniper}!")
 
-        # Smart Money
         sm = sm_buy - sm_sell
         if sm > 5:
             score += 2; signals.append(f"✅ Smart money NET BUY +{sm}")
         elif sm < -5:
             score -= 1; warnings.append(f"⚠️ Smart money NET SELL {sm}")
 
-    # ── Rugcheck scoring ──────────────────────────────────
     if rugcheck.get("available"):
         rc = rugcheck.get("score", 0)
         rc_risks = rugcheck.get("risk_count", 0)
@@ -706,12 +612,10 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
             warnings.append(f"⚠️ Rugcheck: {rc_risks} risiko: "
                            f"{', '.join(rugcheck.get('risks', [])[:2])}")
 
-    # ── Helius scoring ────────────────────────────────────
     if helius.get("available"):
         top10 = helius.get("top10_pct", 0)
         hub   = helius.get("hub_spoke", False)
 
-        # [v9.9-3] Hub & Spoke T0 = penalti score, bukan reject
         if hub and tier == "T0":
             score -= 5; warnings.append("🔴 Hub & Spoke (T0 — token sangat baru)")
         elif top10 <= 10:
@@ -723,9 +627,6 @@ def score_safety(gmgn: dict, rugcheck: dict, helius: dict,
         elif top10 <= HARD_REJECT_TOP10:
             score -= 2; warnings.append(f"🔴 Top 10 tinggi: {top10:.1f}%!")
 
-    # Hitung safety_pct (0–100) untuk display bar
-    # Basis: score bisa dari sekitar -15 sampai +35
-    # Map ke 0–100 dengan clamp
     safety_pct = max(0, min(100, int((score + 15) / 50 * 100)))
 
     return score, signals, warnings, safety_pct
@@ -739,7 +640,10 @@ def score_prepump(price: float, open_c1: float,
     score = 0; signals = []; warnings = []
     r_m5  = bm5 / max(sm5, 1)
     r_h1  = bh1 / max(sh1, 1)
-    avg5m = vh1 / 12 if vh1 > 0 else 0
+
+    # [FIX-3] Volume Spike Hallucination pada Token Baru
+    active_m5 = max(1, min(12, int(age_h * 60 / 5))) if age_h > 0 else 1
+    avg5m = vm5 if active_m5 <= 1 else (vh1 / active_m5 if vh1 > 0 else 0)
 
     # Volume spike
     if avg5m > 0:
@@ -795,9 +699,6 @@ def score_prepump(price: float, open_c1: float,
     elif age_h <= 3.0:
         score += 1; signals.append(f"🆕 Token fresh: {age_h:.1f}h")
 
-    # C1 — toleransi 10% untuk konsistensi dengan holds_c1
-    # [v9.9.2-FX3] Skip Hold C1 check jika token < 1h
-    # Evidence: WON (0.5h, Hold C1 TIDAK) → 3.8x. C1 belum establish di token sangat fresh.
     if age_h < 1.0:
         pass  # tidak cek C1, token terlalu fresh untuk C1 yang valid
     elif open_c1 > 0 and price >= open_c1 * 0.9:
@@ -821,7 +722,7 @@ def score_core_pattern(price: float, open_c1: float,
                        m5: float, h1: float, h6: float, h24: float,
                        vm5: float, vh1: float, vh6: float,
                        bm5: int, sm5: int, bh1: int, sh1: int,
-                       tracked_high: float = 0) -> tuple:
+                       tracked_high: float = 0, age_h: float = 0) -> tuple:
     score = 0; signals = []; warnings = []
     r_m5 = bm5 / max(sm5, 1)
     r_h1 = bh1 / max(sh1, 1)
@@ -851,16 +752,17 @@ def score_core_pattern(price: float, open_c1: float,
     else:
         warnings.append(f"⚠️ Dip dangkal: -{dip:.0f}%")
 
-    # C1 hold — konsisten di 0.9x threshold
     if open_c1 > 0:
         if price >= open_c1 * 0.9:
             score += 3; signals.append(f"✅ Hold C1 (+{((price-open_c1)/open_c1*100):.0f}%)")
         else:
             warnings.append("🔴 Harga tembus Open C1!"); score -= 2
 
-    # Volume staircase
-    avg5m = vh1 / 12 if vh1 > 0 else 0
+    # Volume staircase [FIX-3]
+    active_m5 = max(1, min(12, int(age_h * 60 / 5))) if age_h > 0 else 1
+    avg5m = vm5 if active_m5 <= 1 else (vh1 / active_m5 if vh1 > 0 else 0)
     avg_h6 = vh6 / 6 if vh6 > 0 else 0
+
     if avg5m > 0:
         vr = vm5 / avg5m
         if vr >= 2.0:
@@ -937,93 +839,61 @@ def get_sl_tp(price: float, tier: str) -> tuple:
             price * tp2_map.get(tier, 3.0),
             int((1 - sl_pct) * 100))
 
-# ── [v9.9.3-PM3] PUMP MEMORY FUNCTIONS v3 ───────────────
-
+# ── PUMP MEMORY FUNCTIONS ───────────────────────────────
 def update_pump_memory(addr: str, mcap: float, h6: float, h1: float,
                        age_h: float = 0):
-    """
-    [v9.9.3] Catat token dengan tracking Birth Floor & Healthy Dump.
-
-    Birth Floor: min_mcap_seen = MCAP terendah yang pernah terlihat.
-    Ini adalah proxy dari 'birth candle low'. Semakin awal token
-    terdeteksi, semakin akurat nilai ini.
-
-    Dump Tracking: dump_scan_count naik setiap scan saat MCAP turun,
-    reset jika rebound > 5%. Minimal 6 scan = dump bertahap (sehat).
-    """
     global pump_memory
     now      = time.time()
     existing = pump_memory.get(addr, {})
 
-    # Inisialisasi record baru jika belum ada
     if not existing:
         pump_memory[addr] = {
             "peak_mcap":       mcap,
             "peak_ts":         now,
-            "min_mcap_seen":   mcap,   # [BF] birth floor proxy
-            "first_seen_age":  age_h,  # [BF] umur token saat pertama terdeteksi
+            "min_mcap_seen":   mcap,
+            "first_seen_age":  age_h,
             "first_seen_ts":   now,
             "last_mcap_seen":  mcap,
-            "dump_scan_count": 0,      # [HD] counter scan penurunan bertahap
+            "dump_scan_count": 0,
             "status":          "new",
             "last_alert":      0,
         }
         print(f"[PM NEW] {addr[:8]} init MCAP ${mcap:,.0f} age {age_h:.1f}h")
         return
 
-    # Update peak
     if mcap > existing.get("peak_mcap", 0):
         pump_memory[addr]["peak_mcap"] = mcap
         pump_memory[addr]["peak_ts"]   = now
-        pump_memory[addr]["dump_scan_count"] = 0  # reset saat buat peak baru
+        pump_memory[addr]["dump_scan_count"] = 0
         print(f"[PM PEAK] {addr[:8]} new peak ${mcap:,.0f} (pump max {max(h6,h1):.0f}%)")
 
-    # [BF] Update birth floor — catat MCAP terendah yang pernah terlihat
     if mcap < existing.get("min_mcap_seen", mcap):
         pump_memory[addr]["min_mcap_seen"] = mcap
         print(f"[PM FLOOR] {addr[:8]} new floor ${mcap:,.0f}")
 
-    # [HD] Dump scan tracking — hitung berapa scan harga turun bertahap
     prev_mcap = existing.get("last_mcap_seen", mcap)
-    if mcap < prev_mcap * 0.99:        # turun > 1% dari scan sebelumnya
+    if mcap < prev_mcap * 0.99:
         pump_memory[addr]["dump_scan_count"] = existing.get("dump_scan_count", 0) + 1
-    elif mcap > prev_mcap * 1.05:      # rebound > 5% → reset counter
+    elif mcap > prev_mcap * 1.05:
         pump_memory[addr]["dump_scan_count"] = 0
     pump_memory[addr]["last_mcap_seen"] = mcap
 
-    # Tandai sebagai "watching" jika sudah pernah pump besar
     pump_pct = max(h6, h1)
     if pump_pct >= PM_PUMP_THRESHOLD and existing.get("status") == "new":
         pump_memory[addr]["status"] = "watching"
         print(f"[PM WATCH] {addr[:8]} pump {pump_pct:.0f}% → watching")
 
-
-def is_healthy_dump(h1: float, h6: float, m5: float,
-                    dump_scan_count: int) -> tuple[bool, str]:
-    """
-    [v9.9.3-HD] Cek apakah dump yang terjadi adalah dump SEHAT.
-
-    Dump sehat = penurunan bertahap oleh 3+ candle, bukan 1-2 candle
-    merah panjang (yang bisa jadi rug atau manipulation).
-
-    Dua lapis:
-    (A) Timeframe proxy: sebagian besar dump harus terjadi SEBELUM 1 jam
-        terakhir. Kalau h1_magnitude > 70% dari h6_magnitude, dump
-        masih terlalu baru / cepat.
-    (B) Scan tracking: bot harus melihat minimal 6 scan penurunan
-        bertahap (= 3 menit dengan interval 30 detik).
-
-    Returns: (is_healthy: bool, reason: str)
-    """
-    # Cek (B) dulu — paling cepat
+def is_healthy_dump(h1: float, h6: float, m5: float, dump_scan_count: int) -> tuple[bool, str]:
     if dump_scan_count < PM_HD_MIN_SCAN_COUNT:
         return False, f"dump_scan {dump_scan_count} < {PM_HD_MIN_SCAN_COUNT} (terlalu cepat)"
 
-    # Cek dump masih aktif
+    # [FIX-5] Cek area m5 yang wajar
     if m5 < PM_HD_M5_MAX_DUMP:
-        return False, f"m5 {m5:.1f}% < {PM_HD_M5_MAX_DUMP}% (dump masih aktif)"
+        return False, f"m5 {m5:.1f}% < {PM_HD_M5_MAX_DUMP}% (pisau jatuh/aktif)"
+        
+    if m5 > 10.0:
+        return False, f"m5 {m5:.1f}% > 10.0% (bounce sudah terjadi/V-Shape)"
 
-    # Cek (A) — h6 harus jauh lebih besar dari h1 (dump sudah lama)
     h6_mag = abs(h6)
     h1_mag = abs(h1)
     if h6_mag > 0 and h1_mag / h6_mag > PM_HD_H1_H6_MAX_RATIO:
@@ -1032,24 +902,11 @@ def is_healthy_dump(h1: float, h6: float, m5: float,
 
     return True, "OK"
 
-
 def check_watchlist_bounce(addr: str, mcap: float,
                            buyer_ratio_m5: float,
                            price_position: float,
                            h1: float = 0, h6: float = 0,
                            m5: float = 0) -> bool:
-    """
-    [v9.9.3-PM3] PM Watchlist v3 — Birth Floor + Healthy Dump.
-
-    Kondisi SEMUA harus terpenuhi:
-    1. Token pernah pump > 3x dari birth floor (pump signifikan)
-    2. Current MCAP dalam range 1.0x–1.8x dari birth floor
-       (harga kembali ke area lahir, bukan dead di bawahnya)
-    3. Floor tidak uncertain (token tidak terlalu tua saat pertama terlihat)
-    4. Dump sehat — tidak terjadi instan 1-2 candle
-    5. Buyer ratio & price position konfirmasi akumulasi
-    6. Cooldown belum habis
-    """
     mem = pump_memory.get(addr)
     if not mem:
         return False
@@ -1064,91 +921,64 @@ def check_watchlist_bounce(addr: str, mcap: float,
     if peak <= 0 or birth_floor <= 0:
         return False
 
-    # [BF-1] Floor reliability — token terlalu tua saat pertama terdeteksi
-    # Bot mungkin tidak lihat birth candle yang sesungguhnya
     if first_age > PM_FLOOR_UNCERTAIN_AGE:
         print(f"[PM SKIP] {addr[:8]} floor uncertain (first seen {first_age:.1f}h)")
         return False
 
-    # [BF-2] Peak harus minimal 3x dari birth floor (pump cukup besar)
     if peak < birth_floor * PM_BIRTH_PEAK_MIN_RATIO:
         return False
 
-    # [BF-3] Current MCAP harus dalam range birth floor zone
     floor_ratio = mcap / birth_floor
     if not (PM_BIRTH_FLOOR_RATIO_MIN <= floor_ratio <= PM_BIRTH_FLOOR_RATIO_MAX):
         return False
 
-    # [HD] Dump harus sehat — bertahap, bukan instan
     healthy, hd_reason = is_healthy_dump(h1, h6, m5, dump_scans)
     if not healthy:
         print(f"[PM SKIP] {addr[:8]} dump tidak sehat — {hd_reason}")
         return False
 
-    # [ACC] Akumulasi: buyer dominan di dasar range
     if buyer_ratio_m5 < PM_BUYER_RATIO_MIN:
         return False
     if price_position > PM_POSITION_MAX:
         return False
 
-    # Cooldown
     if time.time() - mem.get("last_alert", 0) < PM_WATCHLIST_COOLDOWN:
         return False
 
     return True
 
-
 def mark_watchlist_alerted(addr: str):
-    """Update timestamp last alert di pump memory."""
     if addr in pump_memory:
         pump_memory[addr]["last_alert"] = time.time()
         pump_memory[addr]["status"]     = "alerted"
 
-# ── [v9.9.2-F4] PRICE POSITION FUNCTION ─────────────────
+# ── PRICE POSITION FUNCTION ─────────────────────────────
 def get_price_position(price: float, pair: dict) -> float:
-    """
-    Estimasi posisi harga dalam range 1 jam.
-    0.0 = di dasar range (potensi naik)
-    1.0 = di puncak range (sudah terlambat)
-
-    Logic:
-    - Gunakan h1 untuk estimasi range low/high
-    - Gunakan m5 untuk tahu apakah harga masih di puncak atau sudah turun
-    - Jika m5 < 0 setelah h1 positif → harga sudah turun dari puncak
-    - Jika m5 > 0 dan h1 > 0 → masih di puncak = position tinggi
-    """
     try:
         pc  = pair.get("priceChange", {})
         h1  = float(pc.get("h1", 0) or 0)
         m5  = float(pc.get("m5", 0) or 0)
 
         if h1 > 0:
-            # Token pumped dalam 1 jam terakhir
-            estimated_low = price / (1 + h1 / 100)  # harga 1 jam lalu
-
+            estimated_low = price / (1 + h1 / 100)
             if m5 < 0:
-                # Harga sudah turun dari puncak — estimasi peak lebih tinggi dari sekarang
-                # peak = price sebelum m5 negatif terjadi
                 estimated_peak = price / (1 + m5 / 100)
             else:
-                # Masih naik atau flat — sekarang = peak
                 estimated_peak = price
-
         else:
-            # Token dump dalam 1 jam — harga 1 jam lalu lebih tinggi
-            estimated_peak = price / (1 + h1 / 100)  # harga 1 jam lalu (lebih tinggi)
-            estimated_low  = price                    # sekarang = dasar
+            estimated_peak = price / (1 + h1 / 100)
+            estimated_low  = price
 
         range_size = estimated_peak - estimated_low
         if range_size <= 0:
-            return 0.5  # tidak bisa hitung, anggap tengah
+            return 0.5
 
         position = (price - estimated_low) / range_size
         return round(max(0.0, min(1.0, position)), 3)
 
     except Exception as e:
         print(f"[F4 ERR] {e}")
-        return -1.0  # tidak tersedia
+        return -1.0
 
 
 # ── MAIN ANALYZE ─────────────────────────────────────────
@@ -1191,52 +1021,41 @@ def analyze_pair(pair: dict) -> dict | None:
         tier = get_tier(mcap, liq, vh1)
         if not tier: return None
 
-        # ── [v9.9-1] GATE 1: PATTERN CHECK PRIMER ────────
-        # Cek dulu dari DexScreener sebelum buang waktu call API luar
-        if not check_pattern_exists(tier, m5, h1, h6, h24, vm5, vh1):
+        # ── Age fallback sebelum API calls ────────────────
+        pair_created = pair.get("pairCreatedAt", 0) or 0
+        age_h_fallback = max(0.0, round((time.time() - pair_created / 1000) / 3600, 2)) if pair_created else 0
+
+        # ── GATE 1: PATTERN CHECK PRIMER ────────
+        if not check_pattern_exists(tier, m5, h1, h6, h24, vm5, vh1, age_h_fallback):
             return None
 
         # C1 & tracked high
         open_c1      = get_open_c1(addr, price)
         tracked_high = get_tracked_high(addr)
 
-        # ── Age fallback sebelum API calls ────────────────
-        pair_created = pair.get("pairCreatedAt", 0) or 0
-        age_h_fallback = max(0.0, round((time.time() - pair_created / 1000) / 3600, 2)) if pair_created else 0
-
-        # ── [v9.9.1] GATE 1.5: EARLY EXIT FILTERS ────────
-        # Evidence-based dari 29 token dataset.
-        # Dipasang SEBELUM API calls → hemat GMGN/Rugcheck/Helius.
-
-        # [F1] Spike Too Late
-        # m5 > 150% = bot deteksi SAAT candle spike, bukan sebelumnya.
-        # Win rate 0% di atas threshold ini. Dataset: pisscoin, Dojo.
+        # ── GATE 1.5: EARLY EXIT FILTERS ────────
         if m5 > 150:
             print(f"[F1 SKIP] {symbol} m5 {m5:.1f}% > 150% — spike too late")
             return None
 
-        # [F2] Already Peaked
-        # h1 sangat negatif + harga sudah tembus C1 = distribusi aktif.
-        # Dataset: USD h1 -24%→<1x, GAMEOVER distribusi aktif.
         _holds_c1_check = price >= open_c1 * 0.9 if open_c1 > 0 else True
         if h1 < -30 and not _holds_c1_check:
             print(f"[F2 SKIP] {symbol} h1 {h1:.1f}% + no Hold C1 — already peaked")
             return None
 
-        # [F3] MCAP Late Entry
-        # Entry terlalu jauh dari kelahiran token = harga sudah naik duluan.
-        # Threshold makin ketat untuk token lebih muda (age bands).
-        # Dataset: 5/5 token Batch 4 loss karena MCAP terlalu tinggi saat alert.
-        # [v9.9.2-FX1] T0 turun dari $85K → $80K
-        # Evidence: MCAP $80-85K win rate 11%, MCAP $60-80K win rate 67%
-        # [v9.9.2-FX2] Gunakan age_h_fallback (DexScreener) secara konsisten
-        # Ini fix bug BBQ: GMGN bilang 0.6h tapi DexScreener > 1h → F3 tidak trigger
-        _f3_threshold = {"T0": 80_000, "T1": 200_000,
+        # [FIX-1] MCAP Late Entry F3 Paradox
+        _f3_base = {"T0": 80_000, "T1": 200_000,
                          "T2": 700_000, "T3": 2_500_000}.get(tier, 80_000)
-        if age_h_fallback == 0:       _f3_threshold *= 0.40  # N/A = unknown = paling konservatif
-        elif age_h_fallback < 0.5:    _f3_threshold *= 0.30  # < 30 menit
-        elif age_h_fallback < 1.0:    _f3_threshold *= 0.50  # 30–60 menit
-        # > 1 jam = threshold normal, tidak ada pengurangan
+        _f3_threshold = _f3_base
+        
+        if age_h_fallback == 0:       _f3_threshold *= 0.40
+        elif age_h_fallback < 0.5:    _f3_threshold *= 0.30
+        elif age_h_fallback < 1.0:    _f3_threshold *= 0.50
+        
+        # FIX: Clamp _f3_threshold agar tidak lebih kecil dari MIN_MCAP tier
+        min_mcap_tier = {"T0": T0_MIN_MCAP, "T1": T1_MIN_MCAP, "T2": T2_MIN_MCAP, "T3": T3_MIN_MCAP}.get(tier, 0)
+        _f3_threshold = max(_f3_threshold, min_mcap_tier * 1.2)
+
         if mcap > _f3_threshold:
             print(f"[F3 SKIP] {symbol} MCAP ${mcap:,.0f} > ${_f3_threshold:,.0f} "
                   f"(tier {tier}, age {age_h_fallback:.1f}h) — late entry")
@@ -1246,40 +1065,33 @@ def analyze_pair(pair: dict) -> dict | None:
         helius_data   = get_helius(addr)
         rugcheck_data = get_rugcheck(addr)
 
-        # Resolve age_h: GMGN → fallback DexScreener
         age_h = gmgn_data.get("age_hours", 0) or age_h_fallback
         if age_h != gmgn_data.get("age_hours", 0):
             print(f"[AGE FALLBACK] {addr[:8]} {age_h:.1f}h dari DexScreener")
             gmgn_data = {**gmgn_data, "age_hours": age_h}
 
-        # ── [v9.9-2] GATE 3: HARD REJECT (bahaya konkrit) ─
+        # ── GATE 3: HARD REJECT (bahaya konkrit) ─
         rejected, reason = check_hard_reject(gmgn_data, rugcheck_data, helius_data, tier)
         if rejected:
             if reason: print(f"[HARD REJECT] {symbol} — {reason}")
             return None
 
-        # ── [v9.9.2-F4] GATE 3.5: PRICE POSITION CHECK ───
-        # Hitung posisi harga dalam range h1.
-        # Jika harga sudah di >85% dari puncak range → terlambat
-        # Evidence: bot tidak bisa bedakan spike vs akumulasi tanpa ini
+        # ── GATE 3.5: PRICE POSITION CHECK & MEMORY ───
         r_m5_val = bm5 / max(sm5, 1)
         price_pos = get_price_position(price, pair)
 
-        # [v9.9.2-PM] Update pump memory SETELAH hard reject
-        # Token berbahaya (honeypot, dll) tidak masuk watchlist.
-        update_pump_memory(addr, mcap, h6, h1, age_h)
-
-        # [FIX] Single call check_watchlist_bounce (sebelumnya double call = bug state race)
+        # [FIX-2] Cek Watchlist Bounce SEBELUM Update Memory
         is_watchlist_bounce = check_watchlist_bounce(addr, mcap, r_m5_val, price_pos, h1, h6, m5)
 
+        # Update memori setelah logic pengecekan bounce dieksekusi
+        update_pump_memory(addr, mcap, h6, h1, age_h)
+
         if price_pos > F4_PEAK_POSITION:
-            # Pengecualian: jika dari watchlist bounce → tetap boleh lanjut
             if not is_watchlist_bounce:
                 print(f"[F4 SKIP] {symbol} price position {price_pos:.2f} > {F4_PEAK_POSITION} "
                       f"— harga di puncak range h1")
                 return None
 
-        # ── [v9.9.2-PM] Watchlist bounce confirm ─────────
         if is_watchlist_bounce:
             print(f"[PM WATCHLIST] {symbol} bounce terdeteksi! "
                   f"MCAP ${mcap:,.0f} buyer {r_m5_val:.1f}x pos {price_pos:.2f}")
@@ -1294,15 +1106,13 @@ def analyze_pair(pair: dict) -> dict | None:
         else:
             p_score, p_sig, p_warn, dip_pct = score_core_pattern(
                 price, open_c1, m5, h1, h6, h24,
-                vm5, vh1, vh6, bm5, sm5, bh1, sh1, tracked_high)
+                vm5, vh1, vh6, bm5, sm5, bh1, sh1, tracked_high, age_h)
             pump_pct = h24 if h24 >= MIN_PUMP_PCT else h6
 
-        # [v9.9.2] Bonus score: harga di dasar range (potensi naik)
         if 0 <= price_pos <= F4_BASE_POSITION_BONUS:
             p_score += 3
             p_sig.append(f"📉 Harga di dasar range ({price_pos:.0%}) — potensi reversal")
 
-        # [v9.9.3] Bonus score: dari watchlist bounce (Birth Floor + Healthy Dump confirmed)
         if is_watchlist_bounce:
             mem = pump_memory.get(addr, {})
             peak        = mem.get("peak_mcap", 0)
@@ -1324,15 +1134,13 @@ def analyze_pair(pair: dict) -> dict | None:
         all_warnings = p_warn + s_warn
         all_signals  = p_sig  + s_sig
 
-        # Sort warnings: 🔴 dulu
         red_w   = [w for w in all_warnings if w.startswith("🔴")]
         other_w = [w for w in all_warnings if not w.startswith("🔴")]
         all_warnings = (red_w + other_w)[:4]
 
-        # Reject kalau ada 2+ warning kritis
         if len(red_w) >= 2: return None
 
-        # ── GRADE (Grade C dihapus) ───────────────────────
+        # ── GRADE ───────────────────────
         if tier == "T0":
             if total >= 15:   grade, status = "A",  "🔥 PRE-PUMP! Entry ultra early!"
             elif total >= 10: grade, status = "B",  "🟡 Sinyal awal ada"
@@ -1362,8 +1170,6 @@ def analyze_pair(pair: dict) -> dict | None:
             "chain": chain, "dex": dex, "pair_id": pair_id,
             "price": price, "pump_pct": round(pump_pct, 1),
             "dip_pct": round(dip_pct, 1), "open_c1": open_c1,
-            # [v9.9.2-FX3] holds_c1 display: token age < 1h → netral (True)
-            # Konsisten dengan score_prepump yang skip C1 check untuk token very fresh
             "holds_c1": (True if age_h < 1.0
                          else (price >= open_c1 * 0.9) if open_c1 > 0
                          else True),
@@ -1434,14 +1240,12 @@ def format_alert(s: dict, is_update: bool = False) -> str:
     temoji, tlabel, tdesc, tpos = tier_map.get(s["tier"], ("⚪","","",""))
     grade_emoji = {"A+":"💎","A":"🏆","B":"🥈"}.get(s["grade"],"")
 
-    # [v9.9-9] Label UPDATE untuk alert token yang sama
-    alert_label = "🔄 UPDATE ALERT v9.9.3!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.3!"
+    alert_label = "🔄 UPDATE ALERT v9.9.4!" if is_update else "🚨 DIP &amp; RIP ALERT v9.9.4!"
     mode_lbl    = "🔥 PRE-PUMP MODE" if s["tier"] == "T0" else "📉 DIP &amp; RIP MODE"
 
     signals_text = "\n".join(s["signals"])  if s["signals"]  else "—"
     warn_text    = "\n".join(s["warnings"]) if s["warnings"] else "✅ Tidak ada warning"
 
-    # Safety fields
     lp  = s.get("lp_burned");   bnd = s.get("bundle_pct")
     dev = s.get("dev_burned_pct"); holders = s.get("holders")
     sniper = s.get("sniper_count")
@@ -1460,26 +1264,22 @@ def format_alert(s: dict, is_update: bool = False) -> str:
              else "🔴" if dev is not None and dev == 0 else
              "⚠️" if dev is not None else "❓")
 
-    # [v9.9-8] Safety score bar
     safety_pct = s.get("safety_pct", 0)
     bar_fill  = "█" * (safety_pct // 10)
     bar_empty = "░" * (10 - safety_pct // 10)
     safety_color = "🟢" if safety_pct >= 60 else "🟡" if safety_pct >= 30 else "🔴"
 
-    # Smart Money — hanya tampil jika GMGN tersedia
     sm_line = ""
     if s.get("gmgn_ok"):
         sm = s["smart_buy"] - s["smart_sell"]
         sm_t = f"+{sm} NET BUY 🟢" if sm > 0 else (f"{sm} NET SELL 🔴" if sm < 0 else "Netral")
         sm_line = f"\n  💡 Smart $: {sm_t}"
 
-    # Helius block
     helius_block = ""
     if s["helius_ok"]:
         hub_t = "⚠️ ADA!" if s["hub_spoke"] else "✅ Tidak ada"
         helius_block = f"\n  🏦 Top 10: <b>{s['top10_pct']:.1f}%</b> | Hub&amp;Spoke: {hub_t}"
 
-    # Rugcheck block
     rc_block = ""
     if s.get("rc_ok"):
         rc_e   = "✅" if s["rc_score"] >= 70 else "⚠️" if s["rc_score"] >= 50 else "🔴"
@@ -1487,7 +1287,6 @@ def format_alert(s: dict, is_update: bool = False) -> str:
         rc_block = (f"\n  {rc_e} Rugcheck: <b>{s['rc_score']}/100</b> "
                    f"| Risks: <b>{s['rc_risks']}</b> | Mint: {mint_t}")
 
-    # Social block
     social_block = ""
     if s.get("social_ok"):
         arr  = "📈" if s["mention_trend"] >= 0 else "📉"
@@ -1580,7 +1379,6 @@ def scan_once():
             elif signal["tier"] == "T2": t2 += 1
             else:                        t3 += 1
 
-            # [v9.9-9] Label UPDATE jika token sama dalam 15 menit
             is_update = (last_alert > 0 and
                         now - last_alert < UPDATE_LABEL_WINDOW_SEC)
 
@@ -1600,7 +1398,7 @@ def scan_once():
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v9.9.3 — CHART IS KING")
+    print("  DIP & RIP BOT v9.9.4 — CHART IS KING")
     print("  Pattern primer | Birth Floor | Healthy Dump")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY else '⚠️ Belum ada key'}")
@@ -1613,17 +1411,18 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v9.9.3 aktif!</b>\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v9.9.4 aktif!</b>\n\n"
         "📊 <b>Arsitektur:</b>\n"
         "   1️⃣ Chart pattern → primer\n"
         "   2️⃣ Filter F1/F2/F3 → evidence-based\n"
         "   3️⃣ Price Position F4 → anti spike\n"
         "   4️⃣ Hard reject → bahaya konkrit\n"
         "   5️⃣ Safety data → confidence booster\n\n"
-        "🆕 <b>Fitur baru v9.9.3:</b>\n"
-        "   [BF] Birth Floor tracking aktif\n"
-        "   [HD] Healthy Dump filter (proxy + scan)\n"
-        "   [PM3] PM Watchlist v3: Floor Ratio check\n\n"
+        "🆕 <b>Fitur patching v9.9.4:</b>\n"
+        "   [+] F3 Late Entry Fix\n"
+        "   [+] Watchlist Race Condition Fix\n"
+        "   [+] Volume Spike Validation\n"
+        "   [+] Helius Hub & Spoke Filter Fix\n\n"
         "🚨 Scan setiap 30 detik!"
     )
 
