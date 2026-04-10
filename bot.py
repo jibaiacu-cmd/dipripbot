@@ -163,10 +163,6 @@ gmgn_cache     = {}
 rugcheck_cache = {}
 helius_cache   = {}
 social_cache   = {}
-TRACKER_FILE        = Path("tracker.json")
-TRACKER_MAX_OPEN_H  = 4       # jam — alert lebih dari ini → expired
-TRACKER_CHECK_MINS  = [30, 60, 240]  # menit ke berapa harga dicek
-TRACKER_NOTIFY_OUTCOME = True  # kirim notif ke Telegram saat outcome
 CACHE_SEC      = 300
 
 # ── TELEGRAM ─────────────────────────────────────────
@@ -1427,15 +1423,14 @@ def scan_once():
             # [B-9] Tandai dulu, simpan state terlepas dari Telegram
             alerted_tokens[addr] = now
             state_dirty          = True
-            if send_telegram(format_alert(signal, is_update)):
-    record_alert(signal)
+            send_telegram(format_alert(signal, is_update))
 
         time.sleep(0.5)
 
     # [B-9] save_state di akhir scan, bukan per token
     if state_dirty:
         save_state()
-check_open_alerts()
+
     print(f"[DONE] T0:{t0} T1:{t1} T2:{t2} T3:{t3}")
 
 def main():
