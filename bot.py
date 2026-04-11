@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v10.0 — CLEAN BUILD
+#   DIP & RIP BOT v10.1 — WITH TRACKER
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
 #
 #   ARSITEKTUR 7 GATE (urutan tidak bisa diubah):
@@ -17,6 +17,11 @@ from pathlib import Path
 #   G5  Hard reject           — bahaya konkrit saja
 #   G6  Pattern + Safety score
 #   G7  Grade + format + kirim
+#
+#   TRACKER (v10.1):
+#   record_alert()       — rekam snapshot saat alert dikirim
+#   check_open_alerts()  — pantau outcome setiap scan cycle
+#   tracker.json         — database semua alert & outcome
 #
 #   BUG FIX DARI VERSI SEBELUMNYA (14 bug kritis):
 #   [B-1]  dev_burned_pct: tinggi = bagus (dev sudah burn token)
@@ -164,6 +169,308 @@ rugcheck_cache = {}
 helius_cache   = {}
 social_cache   = {}
 CACHE_SEC      = 300
+
+# ══════════════════════════════════════════════════════
+#   TRACKER — rekam alert & pantau outcome
+# ══════════════════════════════════════════════════════
+
+TRACKER_FILE           = Path("tracker.json")
+TRACKER_MAX_OPEN_H     = 4      # jam — lebih dari ini → expired
+TRACKER_CHECK_MINS     = [30, 60, 240]  # snapshot harga di menit ke-
+TRACKER_NOTIFY_OUTCOME = True   # kirim notif Telegram saat outcome
+
+def _load_tracker() -> dict:
+    if TRACKER_FILE.exists():
+        try:
+            with open(TRACKER_FILE, "r") as f:
+                data = json.load(f)
+            open_n = sum(1 for a in data.get("alerts", [])
+                         if a.get("outcome") == "open")
+            print(f"[TRACKER] Loaded: "
+                  f"{len(data.get('alerts', []))} total, "
+                  f"{open_n} open")
+            return data
+        except Exception as e:
+            print(f"[TRACKER ERR] Load gagal: {e} — fresh start")
+    return {"alerts": []}
+
+def _save_tracker():
+    try:
+        with open(TRACKER_FILE, "w") as f:
+            json.dump(tracker_db, f, indent=2)
+    except Exception as e:
+        print(f"[TRACKER ERR] Save gagal: {e}")
+
+tracker_db = _load_tracker()
+
+# ── RECORD ALERT ──────────────────────────────────────
+def record_alert(signal: dict):
+    """
+    Dipanggil tepat setelah send_telegram() berhasil.
+    Rekam snapshot lengkap ke tracker.json.
+    Jika sudah ada record open untuk addr yang sama → skip.
+    """
+    now = time.time()
+
+    # Guard: jangan duplikasi record open untuk token yang sama
+    for existing in tracker_db["alerts"]:
+        if (existing.get("addr")    == signal["addr"]
+                and existing.get("outcome") == "open"):
+            print(f"[TRACKER] {signal['symbol']} sudah open, skip")
+            return
+
+    record = {
+        # Identitas
+        "addr":           signal["addr"],
+        "symbol":         signal["symbol"],
+        "name":           signal["name"],
+        "tier":           signal["tier"],
+        "grade":          signal["grade"],
+        "alert_time":     now,
+        "alert_time_str": time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(now)),
+
+        # Harga & level saat alert
+        "entry_price": signal["price"],
+        "open_c1":     signal["open_c1"],
+        "sl_price":    signal["sl"],
+        "tp1_price":   signal["tp1"],
+        "tp2_price":   signal["tp2"],
+        "sl_pct":      signal["sl_pct"],
+
+        # Pattern saat alert
+        "pump_pct":   signal["pump_pct"],
+        "dip_pct":    signal["dip_pct"],
+        "holds_c1":   signal["holds_c1"],
+        "m5":         signal["m5"],
+        "h1":         signal["h1"],
+        "h6":         signal["h6"],
+        "h24":        signal["h24"],
+        "score":      signal["total"],
+        "safety_pct": signal["safety_pct"],
+
+        # Safety data saat alert — [B-11] None jika tidak ada
+        "lp_burned":      signal.get("lp_burned"),
+        "bundle_pct":     signal.get("bundle_pct"),
+        "dev_burned_pct": signal.get("dev_burned_pct"),
+        "holders":        signal.get("holders"),
+        "sniper_count":   signal.get("sniper_count"),
+        "rc_score":       signal.get("rc_score", 0),
+        "rc_risks":       signal.get("rc_risks", 0),
+
+        # Market saat alert
+        "mcap":  signal["mcap"],
+        "liq":   signal["liq"],
+        "vh24":  signal["vh24"],
+        "chart": signal["chart"],
+
+        # Outcome — diisi oleh check_open_alerts()
+        "outcome":            "open",
+        "outcome_time":       None,
+        "outcome_time_str":   None,
+        "minutes_to_outcome": None,
+
+        # Snapshot harga di titik waktu
+        "price_30m":  None,
+        "price_60m":  None,
+        "price_240m": None,
+
+        # Hasil
+        "max_price_seen": signal["price"],
+        "max_gain_pct":   0.0,
+        "result_pct":     None,
+    }
+
+    tracker_db["alerts"].append(record)
+    _save_tracker()
+    print(f"[TRACKER] ✅ Recorded: {signal['symbol']} "
+          f"{signal['tier']}/{signal['grade']} "
+          f"entry=${signal['price']:.8f}")
+
+# ── AMBIL HARGA SEKARANG ──────────────────────────────
+def _get_current_price(addr: str) -> float | None:
+    """
+    Ambil harga token dari DexScreener.
+    Return None jika tidak ditemukan atau harga 0.
+    """
+    try:
+        r = api_get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+            timeout=10)
+        if not r or r.status_code != 200:
+            return None
+        pairs = r.json().get("pairs", [])
+        if not pairs:
+            return None
+        best  = sorted(pairs,
+                       key=lambda x: x.get("volume", {}).get("h24", 0),
+                       reverse=True)[0]
+        price = float(best.get("priceUsd", 0) or 0)
+        return price if price > 0 else None
+    except Exception as e:
+        print(f"[TRACKER PRICE ERR] {addr[:8]}: {e}")
+        return None
+
+# ── TUTUP RECORD ──────────────────────────────────────
+def _close_record(rec: dict, outcome: str,
+                  close_price: float, now: float):
+    """Isi field outcome pada record yang sudah ditutup."""
+    entry      = rec["entry_price"]
+    # [B-12] Guard division by zero
+    result_pct = (
+        (close_price - entry) / entry * 100
+        if entry > 0 and close_price > 0
+        else -100.0
+    )
+    elapsed = (now - rec["alert_time"]) / 60
+
+    rec["outcome"]             = outcome
+    rec["outcome_time"]        = now
+    rec["outcome_time_str"]    = time.strftime(
+        "%Y-%m-%d %H:%M:%S", time.localtime(now))
+    rec["minutes_to_outcome"]  = round(elapsed, 1)
+    rec["result_pct"]          = round(result_pct, 2)
+
+    # Pastikan snapshot 240m terisi
+    if rec.get("price_240m") is None:
+        rec["price_240m"] = close_price if close_price > 0 else None
+
+# ── NOTIF OUTCOME KE TELEGRAM ─────────────────────────
+def _notify_outcome(rec: dict, result_pct: float, outcome: str):
+    """Kirim notifikasi outcome jika TRACKER_NOTIFY_OUTCOME aktif."""
+    if not TRACKER_NOTIFY_OUTCOME:
+        return
+
+    label_map = {
+        "win_tp2":       "🎯🎯 TP2 TERCAPAI!",
+        "win_tp1":       "🎯 TP1 tercapai",
+        "loss_sl":       "🔴 Stop Loss",
+        "rug_suspected": "💀 Rug suspected",
+        "expired":       "⏰ Expired (4 jam)",
+    }
+    label    = label_map.get(outcome, outcome)
+    mins     = rec.get("minutes_to_outcome", 0)
+    max_gain = rec.get("max_gain_pct", 0)
+    sign     = "+" if result_pct >= 0 else ""
+    max_sign = "+" if max_gain   >= 0 else ""
+
+    msg = (
+        f"📊 <b>TRACKER UPDATE</b>\n\n"
+        f"{label}\n\n"
+        f"🪙 <b>{rec['symbol']}</b> | "
+        f"{rec['tier']}/{rec['grade']}\n"
+        f"⏱ Waktu: <b>{mins:.0f} menit</b>\n"
+        f"💹 Entry: ${rec['entry_price']:.8f}\n"
+        f"📈 Hasil: <b>{sign}{result_pct:.1f}%</b>\n"
+        f"🏆 Max gain: {max_sign}{max_gain:.1f}%\n\n"
+        f"🔗 <a href=\"{rec['chart']}\">Chart</a>"
+    )
+    send_telegram(msg)
+
+# ── CHECK OPEN ALERTS ─────────────────────────────────
+def check_open_alerts():
+    """
+    Dipanggil di akhir setiap scan_once().
+    Cek harga terbaru untuk semua alert yang masih open.
+    Update outcome jika SL/TP tercapai atau expired.
+
+    Urutan cek outcome: TP2 → TP1 → SL → expired.
+    Rug suspected: token hilang dari DexScreener > 30 menit.
+    """
+    now       = time.time()
+    open_recs = [a for a in tracker_db["alerts"]
+                 if a.get("outcome") == "open"]
+
+    if not open_recs:
+        return
+
+    print(f"[TRACKER] Checking {len(open_recs)} open alert(s)...")
+    changed = False
+
+    for rec in open_recs:
+        addr        = rec["addr"]
+        symbol      = rec["symbol"]
+        entry       = rec["entry_price"]
+        alert_time  = rec["alert_time"]
+        elapsed_min = (now - alert_time) / 60
+        elapsed_h   = elapsed_min / 60
+
+        current_price = _get_current_price(addr)
+
+        # ── Token hilang dari DexScreener ────────────
+        if current_price is None:
+            if elapsed_h >= 0.5:   # tunggu 30 menit sebelum declare
+                _close_record(rec, "rug_suspected", 0.0, now)
+                changed = True
+                _notify_outcome(rec, -100.0, "rug_suspected")
+                print(f"[TRACKER] 💀 {symbol} rug suspected "
+                      f"({elapsed_min:.0f}m)")
+            continue
+
+        # ── Update max price & max gain ───────────────
+        if current_price > rec.get("max_price_seen", entry):
+            rec["max_price_seen"] = current_price
+            if entry > 0:
+                rec["max_gain_pct"] = round(
+                    (current_price - entry) / entry * 100, 2)
+            changed = True
+
+        # ── Snapshot di menit tertentu ────────────────
+        for mins in TRACKER_CHECK_MINS:
+            key = f"price_{mins}m"
+            if rec.get(key) is None and elapsed_min >= mins:
+                rec[key] = current_price
+                print(f"[TRACKER] 📸 {symbol} "
+                      f"snapshot {mins}m = ${current_price:.8f}")
+                changed = True
+
+        # ── Hitung result_pct sekarang ────────────────
+        # [B-12] Guard division by zero
+        result_pct = (
+            (current_price - entry) / entry * 100
+            if entry > 0 else 0.0
+        )
+
+        # ── Cek outcome (TP2 dulu, TP1, SL) ──────────
+        if current_price >= rec["tp2_price"]:
+            _close_record(rec, "win_tp2", current_price, now)
+            changed = True
+            _notify_outcome(rec, result_pct, "win_tp2")
+            print(f"[TRACKER] 🎯🎯 {symbol} HIT TP2 "
+                  f"+{result_pct:.1f}% ({elapsed_min:.0f}m)")
+            continue
+
+        if current_price >= rec["tp1_price"]:
+            _close_record(rec, "win_tp1", current_price, now)
+            changed = True
+            _notify_outcome(rec, result_pct, "win_tp1")
+            print(f"[TRACKER] 🎯 {symbol} HIT TP1 "
+                  f"+{result_pct:.1f}% ({elapsed_min:.0f}m)")
+            continue
+
+        if current_price <= rec["sl_price"]:
+            _close_record(rec, "loss_sl", current_price, now)
+            changed = True
+            _notify_outcome(rec, result_pct, "loss_sl")
+            print(f"[TRACKER] 🔴 {symbol} HIT SL "
+                  f"{result_pct:.1f}% ({elapsed_min:.0f}m)")
+            continue
+
+        # ── Expired ───────────────────────────────────
+        if elapsed_h >= TRACKER_MAX_OPEN_H:
+            _close_record(rec, "expired", current_price, now)
+            changed = True
+            _notify_outcome(rec, result_pct, "expired")
+            print(f"[TRACKER] ⏰ {symbol} EXPIRED "
+                  f"{result_pct:+.1f}% ({elapsed_h:.1f}h)")
+            continue
+
+        # Masih open
+        print(f"[TRACKER] ⏳ {symbol} open {elapsed_min:.0f}m "
+              f"| ${current_price:.8f} ({result_pct:+.1f}%)")
+
+    if changed:
+        _save_tracker()
 
 # ── TELEGRAM ─────────────────────────────────────────
 def send_telegram(message: str) -> bool:
@@ -1423,7 +1730,8 @@ def scan_once():
             # [B-9] Tandai dulu, simpan state terlepas dari Telegram
             alerted_tokens[addr] = now
             state_dirty          = True
-            send_telegram(format_alert(signal, is_update))
+            if send_telegram(format_alert(signal, is_update)):
+                record_alert(signal)   # rekam ke tracker
 
         time.sleep(0.5)
 
@@ -1431,17 +1739,19 @@ def scan_once():
     if state_dirty:
         save_state()
 
+    check_open_alerts()    # pantau outcome alert yang masih open
     print(f"[DONE] T0:{t0} T1:{t1} T2:{t2} T3:{t3}")
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v10.0 — CLEAN BUILD")
+    print("  DIP & RIP BOT v10.1 — WITH TRACKER")
     print("  Core: Token Aman + Dump Sehat + Second Pump")
-    print("  14 bug kritis diperbaiki | Arsitektur 7 gate")
+    print("  14 bug kritis diperbaiki | Tracker aktif")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY     else '⚠️  Belum ada key'}")
     print(f"  Lunar   : {'✅' if LUNARCRUSH_KEY else '⚠️  Belum ada key'}")
     print(f"  State   : {'✅ ' + str(STATE_FILE) if STATE_FILE.exists() else '🆕 Fresh start'}")
+    print(f"  Tracker : {'✅ ' + str(TRACKER_FILE) if TRACKER_FILE.exists() else '🆕 Fresh start'}")
     print(f"  T0 Pre-pump : ${T0_MIN_MCAP/1000:.0f}K–${T0_MAX_MCAP/1000:.0f}K")
     print(f"  T1 Early    : ${T1_MIN_MCAP/1000:.0f}K–${T1_MAX_MCAP/1000:.0f}K")
     print(f"  T2 Normal   : ${T2_MIN_MCAP/1000:.0f}K–${T2_MAX_MCAP/1000:.0f}K")
@@ -1449,21 +1759,16 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v10.0 aktif!</b>\n\n"
-        "🔧 <b>Clean build — 14 bug kritis diperbaiki:</b>\n\n"
-        "✅ Dev burned logika benar (tinggi = bagus)\n"
-        "✅ tracked_high dari internal tracker\n"
-        "✅ Age fallback sebelum safety check\n"
-        "✅ GMGN ×100 guard + clamp\n"
-        "✅ Rugcheck score normalisasi\n"
-        "✅ API timeout tidak infinite loop\n"
-        "✅ Data kosong = N/A, bukan 0%\n"
-        "✅ save_state tidak terikat Telegram\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v10.1 aktif!</b>\n\n"
+        "🆕 <b>Tracker aktif:</b>\n"
+        "📸 Rekam setiap alert otomatis\n"
+        "⏱ Pantau outcome tiap 30 detik\n"
+        "🎯 Notif TP1/TP2/SL ke Telegram\n"
+        "📊 Data tersimpan di tracker.json\n\n"
         "🏗️ <b>Arsitektur 7 gate:</b>\n"
         "G1 Basic → G2 Pattern → G3 F1/F2\n"
         "→ G4 API → G5 Hard reject\n"
         "→ G6 Score → G7 Alert\n\n"
-        f"🌐 LunarCrush: display only\n"
         "🚨 Scan setiap 30 detik!"
     )
 
