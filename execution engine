@@ -1,0 +1,1111 @@
+# ══════════════════════════════════════════════════════════════════════
+#   EXECUTION ENGINE — DIP & RIP BOT
+#   File: execution_engine.py  (letakkan di direktori yang sama dengan bot_v11.py)
+#
+#   CARA KERJA:
+#   bot_v11.py memanggil:
+#     _engine.on_signal(signal)      — saat sinyal entry baru ditemukan
+#     _engine.run_exit_checks()      — tiap scan untuk cek TP/SL/Trailing
+#     _engine.start()                — start thread kill switch Telegram
+#
+#   KOMPONEN:
+#   ┌─ Config            — semua parameter di satu tempat
+#   ├─ Database          — SQLite: trades, positions, equity_log, errors
+#   ├─ RiskGuard         — validasi sebelum setiap order
+#   ├─ PositionTracker   — posisi terbuka + P&L real-time
+#   ├─ PaperExecutor     — simulasi buy/sell dengan slippage realistis
+#   ├─ LiveExecutor      — scaffold Jupiter swap (belum aktif)
+#   ├─ KillSwitch        — Telegram: /pause /resume /stop /status /balance
+#   └─ ExecutionEngine   — orkestrator utama
+#
+#   MODE:
+#   PAPER_TRADE = True   → simulasi penuh, tidak ada transaksi nyata
+#   PAPER_TRADE = False  → LIVE ⚠️  (aktifkan hanya setelah 2+ minggu paper)
+#
+#   LIMITS KONSERVATIF (fase 1):
+#   MAX_SOL_PER_TRADE   = 0.05 SOL
+#   MAX_TOTAL_EXPOSURE  = 0.25 SOL
+#   MAX_DAILY_LOSS_SOL  = 0.10 SOL  (circuit breaker)
+#   MAX_OPEN_POSITIONS  = 5
+#
+#   KEAMANAN PRIVATE KEY:
+#   Jangan pernah hardcode di sini. Simpan sebagai env var:
+#     export WALLET_PRIVATE_KEY="your_base58_private_key"
+# ══════════════════════════════════════════════════════════════════════
+
+import os
+import time
+import json
+import sqlite3
+import threading
+import requests
+from datetime import datetime, date
+from pathlib import Path
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 1: CONFIG
+# ══════════════════════════════════════════════════════════════════════
+
+# ── MODE UTAMA ────────────────────────────────────────────────────────
+# WAJIB paper trade minimal 2 minggu sebelum ubah ke False
+PAPER_TRADE = True
+
+# ── RISK PARAMETERS (konservatif — fase 1) ───────────────────────────
+MAX_SOL_PER_TRADE     = 0.05    # maks SOL per satu trade
+MAX_TOTAL_EXPOSURE    = 0.25    # total SOL di semua posisi terbuka
+MAX_DAILY_LOSS_SOL    = 0.10    # circuit breaker: stop jika rugi > ini hari ini
+MAX_OPEN_POSITIONS    = 5       # maks posisi terbuka bersamaan
+MIN_SOL_RESERVE       = 0.02    # selalu sisakan SOL untuk gas fee
+
+# ── POSITION SIZING per TIER ──────────────────────────────────────────
+# Persentase dari MAX_SOL_PER_TRADE — T0 paling berisiko → terkecil
+POSITION_SIZE_BY_TIER = {
+    "T0": 0.60,   # 0.03 SOL
+    "T1": 0.80,   # 0.04 SOL
+    "T2": 1.00,   # 0.05 SOL
+    "T3": 0.80,   # 0.04 SOL
+}
+
+# ── GRADE FILTER — hanya eksekusi jika grade memenuhi minimum ─────────
+EXEC_MIN_GRADE = {"T0": "A", "T1": "B", "T2": "B", "T3": "A"}
+
+# ── SLIPPAGE SIMULASI (paper) ─────────────────────────────────────────
+PAPER_SLIPPAGE_BUY_PCT  = 1.5
+PAPER_SLIPPAGE_SELL_PCT = 2.0
+
+# ── TRAILING SL ───────────────────────────────────────────────────────
+TRAILING_ACTIVATE_PCT = 30.0    # aktifkan trailing saat profit > 30%
+TRAILING_SL_PCT       = 15.0    # trailing SL = 15% di bawah tracked high
+
+# ── LIVE TX PARAMS (untuk fase live nanti) ────────────────────────────
+SLIPPAGE_BPS          = 500     # 5% slippage tolerance Jupiter
+PRIORITY_FEE_LAMPORTS = 100_000
+MAX_TX_RETRY          = 3
+TX_CONFIRM_TIMEOUT    = 60
+
+# ── TELEGRAM ─────────────────────────────────────────────────────────
+BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "")
+CHAT_ID    = os.environ.get("CHAT_ID",    "")
+
+# ── DATABASE & STATE ─────────────────────────────────────────────────
+DB_PATH               = Path("trading.db")
+PAPER_INITIAL_BALANCE = 1.0     # simulasi mulai dengan 1 SOL
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 2: DATABASE
+# ══════════════════════════════════════════════════════════════════════
+
+def init_db(conn: sqlite3.Connection):
+    """Buat semua tabel jika belum ada. Dipanggil saat engine startup."""
+    c = conn.cursor()
+
+    # trades — setiap aksi buy / sell
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            REAL    NOT NULL,
+            date_str      TEXT    NOT NULL,
+            mode          TEXT    NOT NULL,
+            action        TEXT    NOT NULL,
+            token_addr    TEXT    NOT NULL,
+            symbol        TEXT    NOT NULL,
+            tier          TEXT    NOT NULL,
+            grade         TEXT    NOT NULL,
+            price_usd     REAL    NOT NULL,
+            sol_amount    REAL    NOT NULL,
+            token_amount  REAL    NOT NULL,
+            entry_price   REAL,
+            pnl_sol       REAL,
+            pnl_pct       REAL,
+            tx_hash       TEXT,
+            note          TEXT
+        )
+    """)
+
+    # positions — posisi terbuka saat ini
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            token_addr             TEXT PRIMARY KEY,
+            symbol                 TEXT NOT NULL,
+            tier                   TEXT NOT NULL,
+            grade                  TEXT NOT NULL,
+            entry_price            REAL NOT NULL,
+            entry_ts               REAL NOT NULL,
+            sol_invested           REAL NOT NULL,
+            token_amount           REAL NOT NULL,
+            token_amount_remaining REAL NOT NULL,
+            sl_price               REAL NOT NULL,
+            tp1_price              REAL NOT NULL,
+            tp2_price              REAL NOT NULL,
+            tp1_hit                INTEGER NOT NULL DEFAULT 0,
+            tp2_hit                INTEGER NOT NULL DEFAULT 0,
+            tracked_high           REAL NOT NULL,
+            trailing_sl            REAL,
+            mode                   TEXT NOT NULL
+        )
+    """)
+
+    # equity_log — snapshot equity tiap akhir scan
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS equity_log (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             REAL    NOT NULL,
+            date_str       TEXT    NOT NULL,
+            equity_sol     REAL    NOT NULL,
+            balance_sol    REAL    NOT NULL,
+            open_positions INTEGER NOT NULL,
+            daily_pnl_sol  REAL    NOT NULL,
+            mode           TEXT    NOT NULL
+        )
+    """)
+
+    # errors — semua error runtime
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS errors (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        REAL NOT NULL,
+            component TEXT NOT NULL,
+            message   TEXT NOT NULL,
+            detail    TEXT
+        )
+    """)
+
+    conn.commit()
+    print("[DB] Database siap →", DB_PATH)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 3: HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+_sol_price_cache = {"price": 0.0, "ts": 0.0}
+
+def get_sol_price_usd() -> float:
+    """Harga SOL/USD dari DexScreener. Cache 60 detik."""
+    now = time.time()
+    if now - _sol_price_cache["ts"] < 60 and _sol_price_cache["price"] > 0:
+        return _sol_price_cache["price"]
+    try:
+        SOL_MINT = "So11111111111111111111111111111111111111112"
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}",
+            timeout=8)
+        if r.status_code == 200:
+            pairs = r.json().get("pairs", [])
+            sol_pairs = [p for p in pairs
+                         if p.get("quoteToken", {}).get("symbol", "")
+                         in ("USDC", "USDT", "USD")]
+            if sol_pairs:
+                best = max(sol_pairs,
+                           key=lambda x: x.get("volume", {}).get("h24", 0))
+                price = float(best.get("priceUsd", 0) or 0)
+                if price > 0:
+                    _sol_price_cache["price"] = price
+                    _sol_price_cache["ts"]    = now
+                    return price
+    except Exception as e:
+        print(f"[SOL PRICE ERR] {e}")
+    return _sol_price_cache["price"]
+
+
+def get_token_price_usd(token_addr: str) -> float:
+    """Harga token saat ini dari DexScreener. Return 0 jika gagal."""
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}",
+            timeout=8)
+        if r.status_code == 200:
+            pairs = r.json().get("pairs", [])
+            if pairs:
+                best = max(pairs,
+                           key=lambda x: x.get("volume", {}).get("h24", 0))
+                return float(best.get("priceUsd", 0) or 0)
+    except Exception as e:
+        print(f"[TOKEN PRICE ERR] {token_addr[:8]} {e}")
+    return 0.0
+
+
+def log_error(conn: sqlite3.Connection, component: str,
+              message: str, detail: str = ""):
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO errors (ts, component, message, detail) "
+            "VALUES (?,?,?,?)",
+            (time.time(), component, message, detail))
+        conn.commit()
+    except Exception:
+        pass
+
+
+def send_tg(msg: str):
+    """Kirim notifikasi Telegram. Non-blocking."""
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[TG ERR] {e}")
+
+
+GRADE_ORDER = {"A+": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 4: RISK GUARD
+# ══════════════════════════════════════════════════════════════════════
+
+class RiskGuard:
+    """
+    Semua pengecekan risk sebelum order dieksekusi.
+    check() → (ok: bool, reason: str)
+    """
+
+    def __init__(self, conn: sqlite3.Connection, paper_balance: list):
+        self.conn          = conn
+        self.paper_balance = paper_balance   # mutable [float]
+        self._lock         = threading.Lock()
+
+    # ── internal helpers ──────────────────────────────────────────────
+
+    def open_count(self) -> int:
+        c = self.conn.cursor()
+        c.execute("SELECT COUNT(*) FROM positions")
+        return c.fetchone()[0]
+
+    def total_exposure(self) -> float:
+        c = self.conn.cursor()
+        c.execute("SELECT SUM(sol_invested) FROM positions")
+        row = c.fetchone()
+        return float(row[0] or 0)
+
+    def daily_pnl(self) -> float:
+        today = date.today().isoformat()
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT SUM(pnl_sol) FROM trades "
+            "WHERE date_str=? AND action LIKE 'SELL%'",
+            (today,))
+        row = c.fetchone()
+        return float(row[0] or 0)
+
+    def already_open(self, token_addr: str) -> bool:
+        c = self.conn.cursor()
+        c.execute("SELECT 1 FROM positions WHERE token_addr=?", (token_addr,))
+        return c.fetchone() is not None
+
+    # ── main check ────────────────────────────────────────────────────
+
+    def check(self, signal: dict, sol_to_invest: float) -> tuple:
+        with self._lock:
+            tier   = signal.get("tier", "T1")
+            grade  = signal.get("grade", "B")
+            addr   = signal.get("addr", "")
+            symbol = signal.get("symbol", "?")
+
+            # R1: Grade minimum per tier
+            min_grade = EXEC_MIN_GRADE.get(tier, "B")
+            if GRADE_ORDER.get(grade, 0) < GRADE_ORDER.get(min_grade, 3):
+                return False, (f"R1: Grade {grade} di bawah minimum "
+                               f"{min_grade} untuk {tier}")
+
+            # R2: Posisi token ini sudah terbuka
+            if self.already_open(addr):
+                return False, f"R2: Posisi {symbol} sudah terbuka"
+
+            # R3: Jumlah posisi maks
+            if self.open_count() >= MAX_OPEN_POSITIONS:
+                return False, (f"R3: Maks posisi terbuka "
+                               f"({MAX_OPEN_POSITIONS}) sudah tercapai")
+
+            # R4: Total exposure
+            exp = self.total_exposure()
+            if exp + sol_to_invest > MAX_TOTAL_EXPOSURE:
+                return False, (f"R4: Exposure {exp:.3f}+{sol_to_invest:.3f} "
+                               f"> max {MAX_TOTAL_EXPOSURE} SOL")
+
+            # R5: Circuit breaker harian
+            dpnl = self.daily_pnl()
+            if dpnl <= -MAX_DAILY_LOSS_SOL:
+                return False, (f"R5: Circuit breaker — rugi hari ini "
+                               f"{dpnl:.4f} SOL ≤ -{MAX_DAILY_LOSS_SOL} SOL")
+
+            # R6: Saldo cukup
+            bal = self.paper_balance[0]
+            if bal - sol_to_invest < MIN_SOL_RESERVE:
+                return False, (f"R6: Saldo tidak cukup — "
+                               f"balance {bal:.4f}, "
+                               f"butuh {sol_to_invest:.4f} + "
+                               f"{MIN_SOL_RESERVE:.4f} reserve")
+
+            # R7: Order minimum
+            if sol_to_invest < 0.001:
+                return False, f"R7: Order terlalu kecil ({sol_to_invest:.4f} SOL)"
+
+            return True, "OK"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 5: POSITION TRACKER
+# ══════════════════════════════════════════════════════════════════════
+
+class PositionTracker:
+    """Kelola semua posisi terbuka. Satu-satunya sumber kebenaran posisi."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn  = conn
+        self._lock = threading.Lock()
+
+    def open_position(self, signal: dict, sol_invested: float,
+                      token_amount: float, mode: str):
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("""
+                INSERT OR REPLACE INTO positions
+                (token_addr, symbol, tier, grade,
+                 entry_price, entry_ts, sol_invested,
+                 token_amount, token_amount_remaining,
+                 sl_price, tp1_price, tp2_price,
+                 tp1_hit, tp2_hit, tracked_high, trailing_sl, mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,NULL,?)
+            """, (
+                signal["addr"],    signal["symbol"],
+                signal["tier"],    signal["grade"],
+                signal["price"],   time.time(),
+                sol_invested,      token_amount,
+                token_amount,                        # remaining = full
+                signal["sl"],      signal["tp1"],
+                signal["tp2"],     signal["price"],  # tracked_high = entry
+                mode,
+            ))
+            self.conn.commit()
+            print(f"[POS OPEN] {signal['symbol']} "
+                  f"{sol_invested:.4f} SOL @ ${signal['price']:.8f}")
+
+    def get_all(self) -> list:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM positions")
+        cols = [d[0] for d in c.description]
+        return [dict(zip(cols, row)) for row in c.fetchall()]
+
+    def update_tracked_high(self, token_addr: str, price: float):
+        with self._lock:
+            self.conn.execute(
+                "UPDATE positions SET tracked_high=MAX(tracked_high,?) "
+                "WHERE token_addr=?", (price, token_addr))
+            self.conn.commit()
+
+    def update_trailing_sl(self, token_addr: str, new_sl: float):
+        with self._lock:
+            self.conn.execute(
+                "UPDATE positions "
+                "SET trailing_sl=?, sl_price=MAX(sl_price,?) "
+                "WHERE token_addr=?",
+                (new_sl, new_sl, token_addr))
+            self.conn.commit()
+
+    def mark_tp1_hit(self, token_addr: str, tokens_sold: float):
+        with self._lock:
+            self.conn.execute(
+                "UPDATE positions "
+                "SET tp1_hit=1, "
+                "token_amount_remaining=token_amount_remaining-? "
+                "WHERE token_addr=?",
+                (tokens_sold, token_addr))
+            self.conn.commit()
+
+    def close(self, token_addr: str):
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM positions WHERE token_addr=?", (token_addr,))
+            self.conn.commit()
+            print(f"[POS CLOSE] {token_addr[:12]}...")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 6: PAPER EXECUTOR
+# ══════════════════════════════════════════════════════════════════════
+
+class PaperExecutor:
+    """
+    Simulasi eksekusi tanpa transaksi on-chain.
+    Mensimulasikan slippage realistis dan latency.
+    """
+
+    def buy(self, token_addr: str, symbol: str,
+            price_usd: float, sol_amount: float) -> dict:
+        time.sleep(0.3)   # simulasi latency
+
+        exec_price   = price_usd * (1 + PAPER_SLIPPAGE_BUY_PCT / 100)
+        sol_price    = get_sol_price_usd()
+        if sol_price <= 0:
+            return {"ok": False, "error": "Harga SOL tidak tersedia"}
+
+        usd_to_spend = sol_amount * sol_price
+        token_amount = usd_to_spend / exec_price
+
+        print(f"[PAPER BUY]  {symbol} | {sol_amount:.4f} SOL → "
+              f"{token_amount:.4f} token @ ${exec_price:.8f} "
+              f"(slip {PAPER_SLIPPAGE_BUY_PCT}%)")
+        return {
+            "ok": True, "token_amount": token_amount,
+            "exec_price": exec_price, "sol_spent": sol_amount,
+            "tx_hash": None,
+        }
+
+    def sell(self, token_addr: str, symbol: str,
+             price_usd: float, token_amount: float) -> dict:
+        time.sleep(0.3)
+
+        exec_price   = price_usd * (1 - PAPER_SLIPPAGE_SELL_PCT / 100)
+        sol_price    = get_sol_price_usd()
+        if sol_price <= 0:
+            return {"ok": False, "error": "Harga SOL tidak tersedia"}
+
+        usd_received = token_amount * exec_price
+        sol_received = usd_received / sol_price
+
+        print(f"[PAPER SELL] {symbol} | {token_amount:.4f} token → "
+              f"{sol_received:.4f} SOL @ ${exec_price:.8f} "
+              f"(slip {PAPER_SLIPPAGE_SELL_PCT}%)")
+        return {
+            "ok": True, "sol_received": sol_received,
+            "exec_price": exec_price, "tx_hash": None,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 7: LIVE EXECUTOR  (scaffold — belum aktif)
+# ══════════════════════════════════════════════════════════════════════
+
+class LiveExecutor:
+    """
+    Eksekutor live trading via Jupiter Aggregator API.
+
+    ⚠️  BELUM AKTIF — scaffold untuk fase live berikutnya.
+    ⚠️  Aktifkan hanya setelah paper trade 2+ minggu konsisten profit.
+
+    Alur eksekusi:
+    1. Jupiter /quote  → harga & route terbaik
+    2. Jupiter /swap   → transaction object
+    3. Sign tx         → private key dari env var
+    4. Submit ke RPC   → Helius / QuickNode
+    5. Poll confirm    → tunggu confirmed / timeout
+    """
+
+    JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote"
+    JUPITER_SWAP  = "https://quote-api.jup.ag/v6/swap"
+    WSOL_MINT     = "So11111111111111111111111111111111111111112"
+
+    def __init__(self):
+        self._wallet  = None
+        self._rpc_url = os.environ.get(
+            "SOLANA_RPC_URL",
+            "https://api.mainnet-beta.solana.com")
+
+    def _load_wallet(self):
+        """
+        Muat keypair dari env var saat pertama dipakai.
+        JANGAN panggil ini kecuali PAPER_TRADE = False.
+        """
+        if self._wallet:
+            return self._wallet
+        raw = os.environ.get("WALLET_PRIVATE_KEY", "")
+        if not raw:
+            raise RuntimeError(
+                "WALLET_PRIVATE_KEY tidak ditemukan di environment.\n"
+                "Set dengan: export WALLET_PRIVATE_KEY='base58_key_kamu'")
+        # Uncomment saat fase live:
+        # from solders.keypair import Keypair
+        # import base58
+        # self._wallet = Keypair.from_bytes(base58.b58decode(raw))
+        # return self._wallet
+        raise NotImplementedError(
+            "LiveExecutor belum diaktifkan.\n"
+            "Install: pip install solders base58\n"
+            "Lalu uncomment kode di _load_wallet()")
+
+    def buy(self, token_addr: str, symbol: str,
+            price_usd: float, sol_amount: float) -> dict:
+        """[SCAFFOLD] Implementasi lengkap di fase live."""
+        raise NotImplementedError("LiveExecutor.buy() belum diimplementasi")
+
+    def sell(self, token_addr: str, symbol: str,
+             price_usd: float, token_amount: float) -> dict:
+        """[SCAFFOLD] Implementasi lengkap di fase live."""
+        raise NotImplementedError("LiveExecutor.sell() belum diimplementasi")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 8: KILL SWITCH
+# ══════════════════════════════════════════════════════════════════════
+
+class KillSwitch:
+    """
+    Telegram listener di thread terpisah.
+    Hanya menerima command dari CHAT_ID yang diizinkan.
+
+    Commands:
+      /pause   — stop order baru, posisi aktif tetap dipantau
+      /resume  — lanjut order baru
+      /stop    — pause + kirim ringkasan posisi
+      /status  — ringkasan akun
+      /balance — saldo paper/live
+    """
+
+    def __init__(self, engine):
+        self.engine   = engine
+        self._offset  = 0
+        self._running = False
+
+    def start(self):
+        self._running = True
+        t = threading.Thread(target=self._loop, daemon=True, name="KillSwitch")
+        t.start()
+        print("[KILL SWITCH] Aktif — mendengarkan Telegram command")
+
+    def stop(self):
+        self._running = False
+
+    def _loop(self):
+        while self._running:
+            try:
+                self._poll()
+            except Exception as e:
+                print(f"[KILL SWITCH ERR] {e}")
+            time.sleep(3)
+
+    def _poll(self):
+        if not BOT_TOKEN:
+            return
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}"
+            f"/getUpdates?offset={self._offset}&timeout=2",
+            timeout=6)
+        if r.status_code != 200:
+            return
+        for upd in r.json().get("result", []):
+            self._offset = upd["update_id"] + 1
+            msg = upd.get("message", {})
+            # Abaikan pesan dari chat lain
+            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+                continue
+            text = (msg.get("text") or "").strip().lower()
+            self._handle(text.split()[0] if text else "")
+
+    def _handle(self, cmd: str):
+        if   cmd == "/pause":   self._pause()
+        elif cmd == "/resume":  self._resume()
+        elif cmd == "/stop":    self._stop()
+        elif cmd == "/status":  self._status()
+        elif cmd == "/balance": self._balance()
+
+    def _pause(self):
+        self.engine.paused = True
+        mode = "📄 PAPER" if PAPER_TRADE else "🔴 LIVE"
+        send_tg(f"⏸ <b>Bot di-pause</b>\n\nMode: {mode}\n"
+                f"Posisi aktif tetap dipantau.\n"
+                f"Order baru: DITAHAN\n\nKirim /resume untuk lanjut.")
+        print("[KILL SWITCH] PAUSED")
+
+    def _resume(self):
+        self.engine.paused = False
+        send_tg("▶️ <b>Bot di-resume</b>\n\nOrder baru: AKTIF")
+        print("[KILL SWITCH] RESUMED")
+
+    def _stop(self):
+        self.engine.paused = True
+        send_tg(f"🛑 <b>Bot di-STOP</b>\n\n"
+                f"{self.engine.status_summary()}\n\n"
+                f"Kirim /resume untuk lanjut.")
+        print("[KILL SWITCH] STOPPED")
+
+    def _status(self):
+        send_tg(f"📊 <b>Status Bot</b>\n\n{self.engine.status_summary()}")
+
+    def _balance(self):
+        bal  = self.engine.paper_balance[0]
+        pnl  = bal - PAPER_INITIAL_BALANCE
+        mode = "📄 Paper" if PAPER_TRADE else "🔴 Live"
+        send_tg(f"💰 <b>Balance ({mode})</b>\n\n"
+                f"Saldo: <b>{bal:.4f} SOL</b>\n"
+                f"Awal:  {PAPER_INITIAL_BALANCE:.4f} SOL\n"
+                f"P&amp;L: <b>{pnl:+.4f} SOL "
+                f"({pnl/PAPER_INITIAL_BALANCE*100:+.1f}%)</b>")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 9: EXECUTION ENGINE (orkestrator)
+# ══════════════════════════════════════════════════════════════════════
+
+class ExecutionEngine:
+    """
+    Orkestrator utama. Interface ke bot_v11.py:
+      engine.on_signal(signal)   — sinyal entry baru
+      engine.run_exit_checks()   — cek exit tiap scan
+      engine.start()             — start kill switch
+      engine.paused              — True = tahan order baru
+    """
+
+    def __init__(self):
+        self.mode          = "paper" if PAPER_TRADE else "live"
+        self.paused        = False
+        self.paper_balance = [PAPER_INITIAL_BALANCE]  # mutable ref
+
+        # DB
+        self.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        init_db(self.conn)
+
+        # Komponen
+        self.risk      = RiskGuard(self.conn, self.paper_balance)
+        self.positions = PositionTracker(self.conn)
+        self.ks        = KillSwitch(self)
+        self.executor  = PaperExecutor() if PAPER_TRADE else LiveExecutor()
+
+        self._lock = threading.Lock()
+
+        mode_label = "PAPER TRADE" if PAPER_TRADE else "LIVE TRADING ⚠️"
+        print(f"[ENGINE] Mode: {mode_label}")
+        if PAPER_TRADE:
+            print(f"[ENGINE] Saldo simulasi: {PAPER_INITIAL_BALANCE} SOL")
+
+    # ── start ─────────────────────────────────────────────────────────
+
+    def start(self):
+        """Dipanggil dari bot_v11.main()."""
+        self.ks.start()
+        mode_str = "📄 PAPER TRADE" if PAPER_TRADE else "🔴 LIVE TRADING ⚠️"
+        send_tg(
+            f"⚙️ <b>Execution Engine aktif</b>\n\n"
+            f"Mode: <b>{mode_str}</b>\n"
+            f"{'Saldo simulasi: ' + str(PAPER_INITIAL_BALANCE) + ' SOL' if PAPER_TRADE else ''}\n\n"
+            f"<b>Risk parameters:</b>\n"
+            f"  Max per trade  : {MAX_SOL_PER_TRADE} SOL\n"
+            f"  Max exposure   : {MAX_TOTAL_EXPOSURE} SOL\n"
+            f"  Circuit breaker: -{MAX_DAILY_LOSS_SOL} SOL/hari\n"
+            f"  Max posisi     : {MAX_OPEN_POSITIONS}\n\n"
+            f"Kill switch:\n"
+            f"  /pause /resume /stop /status /balance"
+        )
+
+    # ── entry signal ──────────────────────────────────────────────────
+
+    def on_signal(self, signal: dict):
+        """
+        Dipanggil saat bot_v11 menemukan sinyal entry baru.
+        Alur: risk check → sizing → buy → catat → notif
+        """
+        if self.paused:
+            print(f"[ENGINE] Paused — skip {signal.get('symbol')}")
+            return
+
+        with self._lock:
+            sym  = signal.get("symbol", "?")
+            tier = signal.get("tier", "T1")
+
+            # ── sizing ────────────────────────────────────────────────
+            mult          = POSITION_SIZE_BY_TIER.get(tier, 0.8)
+            sol_to_invest = round(MAX_SOL_PER_TRADE * mult, 6)
+
+            # ── risk check ────────────────────────────────────────────
+            ok, reason = self.risk.check(signal, sol_to_invest)
+            if not ok:
+                print(f"[RISK BLOCK] {sym} — {reason}")
+                log_error(self.conn, "RiskGuard", f"Blocked {sym}", reason)
+                return
+
+            # ── eksekusi BUY ──────────────────────────────────────────
+            print(f"[ENGINE] BUY {sym} | {tier} | {sol_to_invest:.4f} SOL")
+            try:
+                res = self.executor.buy(
+                    token_addr=signal.get("addr", ""),
+                    symbol=sym,
+                    price_usd=signal.get("price", 0),
+                    sol_amount=sol_to_invest,
+                )
+            except Exception as e:
+                log_error(self.conn, "buy", str(e), sym)
+                print(f"[ENGINE ERR] Buy exception: {e}")
+                return
+
+            if not res.get("ok"):
+                log_error(self.conn, "buy", res.get("error", "?"), sym)
+                print(f"[ENGINE] Buy gagal: {res.get('error')}")
+                return
+
+            # ── update saldo paper ────────────────────────────────────
+            if PAPER_TRADE:
+                self.paper_balance[0] -= res["sol_spent"]
+
+            # ── catat ke DB ───────────────────────────────────────────
+            self._log_trade(
+                action="BUY", signal=signal,
+                price_exec=res["exec_price"],
+                sol_amount=res["sol_spent"],
+                token_amount=res["token_amount"],
+                tx_hash=res.get("tx_hash"),
+            )
+
+            # ── buka posisi ───────────────────────────────────────────
+            self.positions.open_position(
+                signal=signal,
+                sol_invested=res["sol_spent"],
+                token_amount=res["token_amount"],
+                mode=self.mode,
+            )
+
+            # ── notifikasi ────────────────────────────────────────────
+            sol_px  = get_sol_price_usd() or 1
+            usd_val = res["sol_spent"] * sol_px
+            send_tg(
+                f"{'📄' if PAPER_TRADE else '🟢'} "
+                f"<b>ORDER TEREKSEKUSI</b>\n\n"
+                f"🪙 <b>{sym}</b> | {tier} | Grade {signal.get('grade')}\n"
+                f"💰 Beli : <b>{res['sol_spent']:.4f} SOL</b> "
+                f"(≈${usd_val:.2f})\n"
+                f"💹 Harga: <b>${res['exec_price']:.8f}</b>\n"
+                f"🎯 Token: {res['token_amount']:.4f}\n\n"
+                f"🔴 SL : ${signal.get('sl', 0):.8f}\n"
+                f"🟡 TP1: ${signal.get('tp1', 0):.8f} — jual 50%\n"
+                f"🟢 TP2: ${signal.get('tp2', 0):.8f} — jual sisanya\n\n"
+                f"{'<i>[SIMULASI — tidak ada tx nyata]</i>' if PAPER_TRADE else ''}"
+            )
+            self._log_equity()
+
+    # ── exit checks ───────────────────────────────────────────────────
+
+    def run_exit_checks(self):
+        """Dipanggil tiap scan. Periksa semua posisi: SL/TP1/TP2/Trailing."""
+        for pos in self.positions.get_all():
+            try:
+                self._check_position(pos)
+            except Exception as e:
+                log_error(self.conn, "exit_check", str(e),
+                          pos.get("token_addr", ""))
+
+    def _check_position(self, pos: dict):
+        addr        = pos["token_addr"]
+        sym         = pos["symbol"]
+        entry       = pos["entry_price"]
+        sl          = pos["sl_price"]
+        tp1         = pos["tp1_price"]
+        tp2         = pos["tp2_price"]
+        tp1_hit     = bool(pos["tp1_hit"])
+        t_high      = pos["tracked_high"]
+        trailing    = pos.get("trailing_sl")
+        tokens_rem  = pos["token_amount_remaining"]
+        sol_inv     = pos["sol_invested"]
+
+        price_now = get_token_price_usd(addr)
+        if price_now <= 0:
+            return
+
+        # update tracked high
+        if price_now > t_high:
+            self.positions.update_tracked_high(addr, price_now)
+            t_high = price_now
+
+        # ── trailing SL ───────────────────────────────────────────────
+        profit_pct = (price_now / entry - 1) * 100
+        if profit_pct >= TRAILING_ACTIVATE_PCT:
+            new_trail = price_now * (1 - TRAILING_SL_PCT / 100)
+            if trailing is None or new_trail > trailing:
+                old_sl = sl
+                self.positions.update_trailing_sl(addr, new_trail)
+                sl = trailing = new_trail
+                send_tg(
+                    f"🔄 <b>TRAILING SL UPDATE</b>"
+                    f"{'📄' if PAPER_TRADE else ''}\n\n"
+                    f"🪙 <b>{sym}</b>\n"
+                    f"💹 Harga: ${price_now:.8f}\n"
+                    f"SL lama: ${old_sl:.8f}\n"
+                    f"🔴 SL baru: <b>${new_trail:.8f}</b>\n"
+                    f"📈 Profit: +{profit_pct:.1f}%"
+                )
+
+        # ── SL hit ────────────────────────────────────────────────────
+        if price_now <= sl:
+            pnl_pct = (price_now / entry - 1) * 100
+            self._do_sell(pos, price_now, tokens_rem, "SELL_SL", pnl_pct)
+            return
+
+        # ── TP2 hit ───────────────────────────────────────────────────
+        if price_now >= tp2 and not pos.get("tp2_hit"):
+            pnl_pct = (price_now / entry - 1) * 100
+            self._do_sell(pos, price_now, tokens_rem, "SELL_TP2", pnl_pct)
+            return
+
+        # ── TP1 hit — partial 50% ─────────────────────────────────────
+        if price_now >= tp1 and not tp1_hit:
+            pnl_pct        = (price_now / entry - 1) * 100
+            tokens_to_sell = pos["token_amount"] * 0.50
+            self._do_partial_sell(pos, price_now, tokens_to_sell, pnl_pct)
+
+    # ── sell helpers ──────────────────────────────────────────────────
+
+    def _do_sell(self, pos: dict, price_now: float,
+                 token_amount: float, action: str, pnl_pct: float):
+        """Full sell — SL atau TP2."""
+        sym = pos["symbol"]
+        print(f"[ENGINE] {action} {sym} @ ${price_now:.8f} ({pnl_pct:+.1f}%)")
+
+        try:
+            res = self.executor.sell(
+                token_addr=pos["token_addr"], symbol=sym,
+                price_usd=price_now, token_amount=token_amount,
+            )
+        except Exception as e:
+            log_error(self.conn, "sell", str(e), sym)
+            return
+
+        if not res.get("ok"):
+            log_error(self.conn, "sell", res.get("error", "?"), sym)
+            return
+
+        sol_recv = res["sol_received"]
+        pnl_sol  = sol_recv - pos["sol_invested"]
+
+        if PAPER_TRADE:
+            self.paper_balance[0] += sol_recv
+
+        sig_stub = {
+            "addr": pos["token_addr"], "symbol": sym,
+            "tier": pos["tier"],       "grade":  pos["grade"],
+            "price": price_now,
+            "sl": pos["sl_price"], "tp1": pos["tp1_price"],
+            "tp2": pos["tp2_price"],
+        }
+        self._log_trade(
+            action=action, signal=sig_stub,
+            price_exec=res["exec_price"],
+            sol_amount=sol_recv, token_amount=token_amount,
+            pnl_sol=pnl_sol, pnl_pct=pnl_pct,
+            entry_price=pos["entry_price"],
+            tx_hash=res.get("tx_hash"),
+        )
+        self.positions.close(pos["token_addr"])
+
+        emoji    = "⛔" if action == "SELL_SL" else "🟢"
+        label    = "STOP LOSS" if action == "SELL_SL" else "TP2 TERCAPAI"
+        send_tg(
+            f"{emoji} <b>{label}</b>"
+            f"{'📄' if PAPER_TRADE else ''}\n\n"
+            f"🪙 <b>{sym}</b> | {pos['tier']}\n"
+            f"💹 Harga exec: ${res['exec_price']:.8f}\n"
+            f"💰 Terima: {sol_recv:.4f} SOL\n"
+            f"📊 P&amp;L: <b>{pnl_sol:+.4f} SOL ({pnl_pct:+.1f}%)</b>\n"
+            f"💼 Saldo: {self.paper_balance[0]:.4f} SOL\n"
+            f"{'<i>[SIMULASI]</i>' if PAPER_TRADE else ''}"
+        )
+        self._log_equity()
+
+    def _do_partial_sell(self, pos: dict, price_now: float,
+                         tokens_to_sell: float, pnl_pct: float):
+        """Partial sell 50% saat TP1 hit."""
+        sym = pos["symbol"]
+        print(f"[ENGINE] SELL_TP1 (50%) {sym} @ ${price_now:.8f}")
+
+        try:
+            res = self.executor.sell(
+                token_addr=pos["token_addr"], symbol=sym,
+                price_usd=price_now, token_amount=tokens_to_sell,
+            )
+        except Exception as e:
+            log_error(self.conn, "sell_partial", str(e), sym)
+            return
+
+        if not res.get("ok"):
+            return
+
+        sol_recv     = res["sol_received"]
+        pnl_sol_half = sol_recv - pos["sol_invested"] * 0.50
+
+        if PAPER_TRADE:
+            self.paper_balance[0] += sol_recv
+
+        sig_stub = {
+            "addr": pos["token_addr"], "symbol": sym,
+            "tier": pos["tier"],       "grade":  pos["grade"],
+            "price": price_now,
+            "sl": pos["sl_price"], "tp1": pos["tp1_price"],
+            "tp2": pos["tp2_price"],
+        }
+        self._log_trade(
+            action="SELL_TP1", signal=sig_stub,
+            price_exec=res["exec_price"],
+            sol_amount=sol_recv, token_amount=tokens_to_sell,
+            pnl_sol=pnl_sol_half, pnl_pct=pnl_pct,
+            entry_price=pos["entry_price"],
+            tx_hash=res.get("tx_hash"),
+            note="partial 50%",
+        )
+        self.positions.mark_tp1_hit(pos["token_addr"], tokens_to_sell)
+
+        send_tg(
+            f"🟡 <b>TP1 TERCAPAI — jual 50%</b>"
+            f"{'📄' if PAPER_TRADE else ''}\n\n"
+            f"🪙 <b>{sym}</b> | {pos['tier']}\n"
+            f"💹 Harga exec: ${res['exec_price']:.8f}\n"
+            f"💰 Terima: {sol_recv:.4f} SOL (50%)\n"
+            f"📊 P&amp;L parsial: "
+            f"<b>{pnl_sol_half:+.4f} SOL ({pnl_pct:+.1f}%)</b>\n\n"
+            f"📌 50% sisa menunggu TP2: ${pos['tp2_price']:.8f}\n"
+            f"🔴 SL aktif: ${pos['sl_price']:.8f}\n"
+            f"{'<i>[SIMULASI]</i>' if PAPER_TRADE else ''}"
+        )
+        self._log_equity()
+
+    # ── DB helpers ────────────────────────────────────────────────────
+
+    def _log_trade(self, action: str, signal: dict,
+                   price_exec: float, sol_amount: float, token_amount: float,
+                   pnl_sol: float = None, pnl_pct: float = None,
+                   entry_price: float = None, tx_hash: str = None,
+                   note: str = ""):
+        c = self.conn.cursor()
+        c.execute("""
+            INSERT INTO trades
+            (ts, date_str, mode, action, token_addr, symbol, tier, grade,
+             price_usd, sol_amount, token_amount, entry_price,
+             pnl_sol, pnl_pct, tx_hash, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            time.time(), date.today().isoformat(), self.mode,
+            action, signal.get("addr",""), signal.get("symbol",""),
+            signal.get("tier",""), signal.get("grade",""),
+            price_exec, sol_amount, token_amount,
+            entry_price, pnl_sol, pnl_pct, tx_hash, note,
+        ))
+        self.conn.commit()
+
+    def _log_equity(self):
+        pos_list  = self.positions.get_all()
+        exposure  = sum(p["sol_invested"] for p in pos_list)
+        c = self.conn.cursor()
+        c.execute("""
+            INSERT INTO equity_log
+            (ts, date_str, equity_sol, balance_sol,
+             open_positions, daily_pnl_sol, mode)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            time.time(), date.today().isoformat(),
+            self.paper_balance[0] + exposure,
+            self.paper_balance[0],
+            len(pos_list),
+            self.risk.daily_pnl(),
+            self.mode,
+        ))
+        self.conn.commit()
+
+    # ── status ────────────────────────────────────────────────────────
+
+    def status_summary(self) -> str:
+        pos_list  = self.positions.get_all()
+        bal       = self.paper_balance[0]
+        dpnl      = self.risk.daily_pnl()
+        exp       = self.risk.total_exposure()
+        mode_str  = "📄 Paper" if PAPER_TRADE else "🔴 Live"
+        pause_str = " | ⏸ PAUSED" if self.paused else ""
+
+        lines = ""
+        for p in pos_list:
+            px  = get_token_price_usd(p["token_addr"])
+            pnl = (px / p["entry_price"] - 1) * 100 if px > 0 else 0
+            lines += (f"\n  • {p['symbol']} {p['tier']} "
+                      f"| {p['sol_invested']:.3f} SOL | {pnl:+.1f}%")
+
+        return (
+            f"Mode: {mode_str}{pause_str}\n\n"
+            f"💰 Saldo: {bal:.4f} SOL\n"
+            f"📊 Exposure: {exp:.4f} SOL\n"
+            f"📈 P&amp;L hari ini: {dpnl:+.4f} SOL\n\n"
+            f"Posisi terbuka ({len(pos_list)}/{MAX_OPEN_POSITIONS}):"
+            f"{lines if lines else chr(10) + '  (kosong)'}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 10: LAPORAN STANDALONE
+# Jalankan: python execution_engine.py
+# ══════════════════════════════════════════════════════════════════════
+
+def print_report():
+    if not DB_PATH.exists():
+        print("Database belum ada. Jalankan bot dulu.")
+        return
+
+    conn = sqlite3.connect(str(DB_PATH))
+    c    = conn.cursor()
+
+    print("\n" + "═" * 65)
+    print("  PAPER TRADE REPORT")
+    print("═" * 65)
+
+    c.execute("SELECT COUNT(*) FROM trades WHERE action='BUY'")
+    buys = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM trades WHERE action LIKE 'SELL%'")
+    sells = c.fetchone()[0]
+    print(f"  Total BUY  : {buys}")
+    print(f"  Total SELL : {sells}")
+
+    c.execute("SELECT SUM(pnl_sol),COUNT(*) FROM trades "
+              "WHERE action LIKE 'SELL%' AND pnl_sol > 0")
+    wr, wc = c.fetchone()
+    c.execute("SELECT SUM(pnl_sol),COUNT(*) FROM trades "
+              "WHERE action LIKE 'SELL%' AND pnl_sol <= 0")
+    lr, lc = c.fetchone()
+    wr, wc = (wr or 0), (wc or 0)
+    lr, lc = (lr or 0), (lc or 0)
+    total  = wc + lc
+    rate   = wc / total * 100 if total > 0 else 0
+
+    print(f"\n  Win rate   : {rate:.1f}%  ({wc}W / {lc}L)")
+    print(f"  Net P&L    : {wr+lr:+.4f} SOL")
+    print(f"  Profit     : +{wr:.4f} SOL")
+    print(f"  Loss       :  {lr:.4f} SOL")
+
+    # Equity curve ringkas
+    c.execute("""
+        SELECT date_str, MAX(equity_sol), MIN(equity_sol)
+        FROM equity_log GROUP BY date_str ORDER BY date_str
+    """)
+    rows = c.fetchall()
+    if rows:
+        print(f"\n  {'Tanggal':<12} {'Max Equity':>12} {'Min Equity':>12}")
+        print("  " + "-" * 38)
+        for dt, hi, lo in rows:
+            print(f"  {dt:<12} {hi:>12.4f} {lo:>12.4f}")
+
+    # 10 trade terakhir
+    c.execute("""
+        SELECT date_str, action, symbol, tier, grade, pnl_sol, pnl_pct
+        FROM trades WHERE action LIKE 'SELL%'
+        ORDER BY ts DESC LIMIT 10
+    """)
+    rows = c.fetchall()
+    if rows:
+        print(f"\n  10 trade terakhir:")
+        print(f"  {'Tgl':<12} {'Aksi':<12} {'Token':<10} "
+              f"{'Tier':<5} {'Grade':<6} {'SOL':>9} {'%':>7}")
+        print("  " + "-" * 60)
+        for r in rows:
+            psol = r[5] or 0
+            ppct = r[6] or 0
+            em   = "✅" if psol > 0 else "❌"
+            print(f"  {r[0]:<12} {em}{r[1]:<11} {r[2]:<10} "
+                  f"{r[3]:<5} {r[4]:<6} {psol:>+9.4f} {ppct:>+6.1f}%")
+
+    print("═" * 65 + "\n")
+    conn.close()
+
+
+if __name__ == "__main__":
+    print_report()
