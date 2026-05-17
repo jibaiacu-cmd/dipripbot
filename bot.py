@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v10.1 — WITH TRACKER
+#   DIP & RIP BOT v11.0 — HARDENED BUILD
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
 #
 #   ARSITEKTUR 7 GATE (urutan tidak bisa diubah):
@@ -18,26 +18,27 @@ from pathlib import Path
 #   G6  Pattern + Safety score
 #   G7  Grade + format + kirim
 #
-#   TRACKER (v10.1):
-#   record_alert()       — rekam snapshot saat alert dikirim
-#   check_open_alerts()  — pantau outcome setiap scan cycle
-#   tracker.json         — database semua alert & outcome
-#
-#   BUG FIX DARI VERSI SEBELUMNYA (14 bug kritis):
-#   [B-1]  dev_burned_pct: tinggi = bagus (dev sudah burn token)
-#   [B-2]  tracked_high dari internal price_tracker (bukan API)
-#   [B-3]  age_h fallback SEBELUM safety check + inject ke gmgn_data
-#   [B-4]  GMGN ×100 guard: clamp ke 100, log jika melebihi
-#   [B-5]  Rugcheck score: normalisasi jika > 100 (÷10)
-#   [B-6]  Rugcheck top10_pct: guard desimal vs persen
-#   [B-7]  api_get/post: Timeout increment attempt natural di for-loop
-#   [B-8]  social_cache: cache result kosong jika no key
-#   [B-9]  save_state: tidak terikat keberhasilan Telegram
-#   [B-10] age_h_fallback clamp ≥ 0 (guard timestamp masa depan)
-#   [B-11] None vs 0: safety field None jika tidak tersedia
-#   [B-12] Division by zero: max(x, 1) dan cek > 0 sebelum bagi
-#   [B-13] price_tracker memory leak: bersihkan > 7 hari
-#   [B-14] Warning sort: 🔴 dulu, limit 4
+#   BUG FIX v10 → v11 (10 perbaikan):
+#   [V11-1]  Rugcheck score: normalisasi SELALU ÷10 jika raw > 10
+#            (v10 hanya ÷10 jika > 100 — score 850 → 85, salah)
+#   [V11-2]  safety_pct formula dikalibrasi ulang: range -10..+38
+#            (v10: range terlalu sempit, banyak token dapat 100%)
+#   [V11-3]  SL/TP dinamis berbasis dip_pct + pump_pct
+#            (v10: statis per tier, tidak kontekstual)
+#   [V11-4]  C1 hanya dicatat setelah lolos G5 (bukan di G3)
+#            (v10: C1 tercatat di harga reject, pakai di scan berikut)
+#   [V11-5]  Hub & Spoke T0: reject jika holders < 50 (bukan hanya -5 score)
+#            (v10: T0 terlalu lunak, tier paling berisiko justru dibiarkan)
+#   [V11-6]  F1 threshold T0 diturunkan ke m5 > 50% (T1+ tetap 150%)
+#            (v10: m5 80–149% masih masuk untuk T0 = terlalu terlambat)
+#   [V11-7]  Exit engine: kirim alert TP hit / SL hit / trailing SL
+#            (v10: tidak ada exit signal sama sekali)
+#   [V11-8]  Cooldown per tier: T0=10m T1=15m T2=20m T3=30m
+#            (v10: semua tier 5 menit — terlalu pendek)
+#   [V11-9]  SOL market context: suppress T0/T1 jika SOL h1 < -5%
+#            (v10: tidak ada filter kondisi pasar global)
+#   [V11-10] scan_once: sorted(all_addr) + trending diproses duluan
+#            (v10: set acak, token bagus bisa terlewat setiap siklus)
 #
 #   DILARANG KERAS (belum divalidasi atau tidak relevan):
 #   - Pump Memory / Watchlist Bounce
@@ -160,8 +161,15 @@ RUGCHECK_HARD_REJECT_RISKS = 5
 RUGCHECK_DANGEROUS_RISKS   = {"copycat", "honeypot", "freeze", "blacklist", "rugpull"}
 
 SCAN_INTERVAL_SEC       = 30
-ALERT_COOLDOWN_SEC      = 300
-UPDATE_LABEL_WINDOW_SEC = 900   # 15 menit = label UPDATE
+# [V11-8] Cooldown per tier — v10 semua 5 menit, terlalu pendek
+ALERT_COOLDOWN_BY_TIER  = {"T0": 600, "T1": 900, "T2": 1200, "T3": 1800}
+ALERT_COOLDOWN_SEC      = 600          # fallback jika tier unknown
+UPDATE_LABEL_WINDOW_SEC = 900          # 15 menit = label UPDATE
+
+# [V11-9] SOL market context
+SOL_MINT               = "So11111111111111111111111111111111111111112"
+SOL_SUPPRESS_THRESHOLD = -5.0          # SOL h1 < -5% → suppress T0/T1
+_sol_context           = {"h1": 0.0, "ts": 0.0}  # cache 5 menit
 
 # ── CACHE ─────────────────────────────────────────────
 gmgn_cache     = {}
@@ -169,308 +177,6 @@ rugcheck_cache = {}
 helius_cache   = {}
 social_cache   = {}
 CACHE_SEC      = 300
-
-# ══════════════════════════════════════════════════════
-#   TRACKER — rekam alert & pantau outcome
-# ══════════════════════════════════════════════════════
-
-TRACKER_FILE           = Path("tracker.json")
-TRACKER_MAX_OPEN_H     = 4      # jam — lebih dari ini → expired
-TRACKER_CHECK_MINS     = [30, 60, 240]  # snapshot harga di menit ke-
-TRACKER_NOTIFY_OUTCOME = True   # kirim notif Telegram saat outcome
-
-def _load_tracker() -> dict:
-    if TRACKER_FILE.exists():
-        try:
-            with open(TRACKER_FILE, "r") as f:
-                data = json.load(f)
-            open_n = sum(1 for a in data.get("alerts", [])
-                         if a.get("outcome") == "open")
-            print(f"[TRACKER] Loaded: "
-                  f"{len(data.get('alerts', []))} total, "
-                  f"{open_n} open")
-            return data
-        except Exception as e:
-            print(f"[TRACKER ERR] Load gagal: {e} — fresh start")
-    return {"alerts": []}
-
-def _save_tracker():
-    try:
-        with open(TRACKER_FILE, "w") as f:
-            json.dump(tracker_db, f, indent=2)
-    except Exception as e:
-        print(f"[TRACKER ERR] Save gagal: {e}")
-
-tracker_db = _load_tracker()
-
-# ── RECORD ALERT ──────────────────────────────────────
-def record_alert(signal: dict):
-    """
-    Dipanggil tepat setelah send_telegram() berhasil.
-    Rekam snapshot lengkap ke tracker.json.
-    Jika sudah ada record open untuk addr yang sama → skip.
-    """
-    now = time.time()
-
-    # Guard: jangan duplikasi record open untuk token yang sama
-    for existing in tracker_db["alerts"]:
-        if (existing.get("addr")    == signal["addr"]
-                and existing.get("outcome") == "open"):
-            print(f"[TRACKER] {signal['symbol']} sudah open, skip")
-            return
-
-    record = {
-        # Identitas
-        "addr":           signal["addr"],
-        "symbol":         signal["symbol"],
-        "name":           signal["name"],
-        "tier":           signal["tier"],
-        "grade":          signal["grade"],
-        "alert_time":     now,
-        "alert_time_str": time.strftime(
-            "%Y-%m-%d %H:%M:%S", time.localtime(now)),
-
-        # Harga & level saat alert
-        "entry_price": signal["price"],
-        "open_c1":     signal["open_c1"],
-        "sl_price":    signal["sl"],
-        "tp1_price":   signal["tp1"],
-        "tp2_price":   signal["tp2"],
-        "sl_pct":      signal["sl_pct"],
-
-        # Pattern saat alert
-        "pump_pct":   signal["pump_pct"],
-        "dip_pct":    signal["dip_pct"],
-        "holds_c1":   signal["holds_c1"],
-        "m5":         signal["m5"],
-        "h1":         signal["h1"],
-        "h6":         signal["h6"],
-        "h24":        signal["h24"],
-        "score":      signal["total"],
-        "safety_pct": signal["safety_pct"],
-
-        # Safety data saat alert — [B-11] None jika tidak ada
-        "lp_burned":      signal.get("lp_burned"),
-        "bundle_pct":     signal.get("bundle_pct"),
-        "dev_burned_pct": signal.get("dev_burned_pct"),
-        "holders":        signal.get("holders"),
-        "sniper_count":   signal.get("sniper_count"),
-        "rc_score":       signal.get("rc_score", 0),
-        "rc_risks":       signal.get("rc_risks", 0),
-
-        # Market saat alert
-        "mcap":  signal["mcap"],
-        "liq":   signal["liq"],
-        "vh24":  signal["vh24"],
-        "chart": signal["chart"],
-
-        # Outcome — diisi oleh check_open_alerts()
-        "outcome":            "open",
-        "outcome_time":       None,
-        "outcome_time_str":   None,
-        "minutes_to_outcome": None,
-
-        # Snapshot harga di titik waktu
-        "price_30m":  None,
-        "price_60m":  None,
-        "price_240m": None,
-
-        # Hasil
-        "max_price_seen": signal["price"],
-        "max_gain_pct":   0.0,
-        "result_pct":     None,
-    }
-
-    tracker_db["alerts"].append(record)
-    _save_tracker()
-    print(f"[TRACKER] ✅ Recorded: {signal['symbol']} "
-          f"{signal['tier']}/{signal['grade']} "
-          f"entry=${signal['price']:.8f}")
-
-# ── AMBIL HARGA SEKARANG ──────────────────────────────
-def _get_current_price(addr: str) -> float | None:
-    """
-    Ambil harga token dari DexScreener.
-    Return None jika tidak ditemukan atau harga 0.
-    """
-    try:
-        r = api_get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
-            timeout=10)
-        if not r or r.status_code != 200:
-            return None
-        pairs = r.json().get("pairs", [])
-        if not pairs:
-            return None
-        best  = sorted(pairs,
-                       key=lambda x: x.get("volume", {}).get("h24", 0),
-                       reverse=True)[0]
-        price = float(best.get("priceUsd", 0) or 0)
-        return price if price > 0 else None
-    except Exception as e:
-        print(f"[TRACKER PRICE ERR] {addr[:8]}: {e}")
-        return None
-
-# ── TUTUP RECORD ──────────────────────────────────────
-def _close_record(rec: dict, outcome: str,
-                  close_price: float, now: float):
-    """Isi field outcome pada record yang sudah ditutup."""
-    entry      = rec["entry_price"]
-    # [B-12] Guard division by zero
-    result_pct = (
-        (close_price - entry) / entry * 100
-        if entry > 0 and close_price > 0
-        else -100.0
-    )
-    elapsed = (now - rec["alert_time"]) / 60
-
-    rec["outcome"]             = outcome
-    rec["outcome_time"]        = now
-    rec["outcome_time_str"]    = time.strftime(
-        "%Y-%m-%d %H:%M:%S", time.localtime(now))
-    rec["minutes_to_outcome"]  = round(elapsed, 1)
-    rec["result_pct"]          = round(result_pct, 2)
-
-    # Pastikan snapshot 240m terisi
-    if rec.get("price_240m") is None:
-        rec["price_240m"] = close_price if close_price > 0 else None
-
-# ── NOTIF OUTCOME KE TELEGRAM ─────────────────────────
-def _notify_outcome(rec: dict, result_pct: float, outcome: str):
-    """Kirim notifikasi outcome jika TRACKER_NOTIFY_OUTCOME aktif."""
-    if not TRACKER_NOTIFY_OUTCOME:
-        return
-
-    label_map = {
-        "win_tp2":       "🎯🎯 TP2 TERCAPAI!",
-        "win_tp1":       "🎯 TP1 tercapai",
-        "loss_sl":       "🔴 Stop Loss",
-        "rug_suspected": "💀 Rug suspected",
-        "expired":       "⏰ Expired (4 jam)",
-    }
-    label    = label_map.get(outcome, outcome)
-    mins     = rec.get("minutes_to_outcome", 0)
-    max_gain = rec.get("max_gain_pct", 0)
-    sign     = "+" if result_pct >= 0 else ""
-    max_sign = "+" if max_gain   >= 0 else ""
-
-    msg = (
-        f"📊 <b>TRACKER UPDATE</b>\n\n"
-        f"{label}\n\n"
-        f"🪙 <b>{rec['symbol']}</b> | "
-        f"{rec['tier']}/{rec['grade']}\n"
-        f"⏱ Waktu: <b>{mins:.0f} menit</b>\n"
-        f"💹 Entry: ${rec['entry_price']:.8f}\n"
-        f"📈 Hasil: <b>{sign}{result_pct:.1f}%</b>\n"
-        f"🏆 Max gain: {max_sign}{max_gain:.1f}%\n\n"
-        f"🔗 <a href=\"{rec['chart']}\">Chart</a>"
-    )
-    send_telegram(msg)
-
-# ── CHECK OPEN ALERTS ─────────────────────────────────
-def check_open_alerts():
-    """
-    Dipanggil di akhir setiap scan_once().
-    Cek harga terbaru untuk semua alert yang masih open.
-    Update outcome jika SL/TP tercapai atau expired.
-
-    Urutan cek outcome: TP2 → TP1 → SL → expired.
-    Rug suspected: token hilang dari DexScreener > 30 menit.
-    """
-    now       = time.time()
-    open_recs = [a for a in tracker_db["alerts"]
-                 if a.get("outcome") == "open"]
-
-    if not open_recs:
-        return
-
-    print(f"[TRACKER] Checking {len(open_recs)} open alert(s)...")
-    changed = False
-
-    for rec in open_recs:
-        addr        = rec["addr"]
-        symbol      = rec["symbol"]
-        entry       = rec["entry_price"]
-        alert_time  = rec["alert_time"]
-        elapsed_min = (now - alert_time) / 60
-        elapsed_h   = elapsed_min / 60
-
-        current_price = _get_current_price(addr)
-
-        # ── Token hilang dari DexScreener ────────────
-        if current_price is None:
-            if elapsed_h >= 0.5:   # tunggu 30 menit sebelum declare
-                _close_record(rec, "rug_suspected", 0.0, now)
-                changed = True
-                _notify_outcome(rec, -100.0, "rug_suspected")
-                print(f"[TRACKER] 💀 {symbol} rug suspected "
-                      f"({elapsed_min:.0f}m)")
-            continue
-
-        # ── Update max price & max gain ───────────────
-        if current_price > rec.get("max_price_seen", entry):
-            rec["max_price_seen"] = current_price
-            if entry > 0:
-                rec["max_gain_pct"] = round(
-                    (current_price - entry) / entry * 100, 2)
-            changed = True
-
-        # ── Snapshot di menit tertentu ────────────────
-        for mins in TRACKER_CHECK_MINS:
-            key = f"price_{mins}m"
-            if rec.get(key) is None and elapsed_min >= mins:
-                rec[key] = current_price
-                print(f"[TRACKER] 📸 {symbol} "
-                      f"snapshot {mins}m = ${current_price:.8f}")
-                changed = True
-
-        # ── Hitung result_pct sekarang ────────────────
-        # [B-12] Guard division by zero
-        result_pct = (
-            (current_price - entry) / entry * 100
-            if entry > 0 else 0.0
-        )
-
-        # ── Cek outcome (TP2 dulu, TP1, SL) ──────────
-        if current_price >= rec["tp2_price"]:
-            _close_record(rec, "win_tp2", current_price, now)
-            changed = True
-            _notify_outcome(rec, result_pct, "win_tp2")
-            print(f"[TRACKER] 🎯🎯 {symbol} HIT TP2 "
-                  f"+{result_pct:.1f}% ({elapsed_min:.0f}m)")
-            continue
-
-        if current_price >= rec["tp1_price"]:
-            _close_record(rec, "win_tp1", current_price, now)
-            changed = True
-            _notify_outcome(rec, result_pct, "win_tp1")
-            print(f"[TRACKER] 🎯 {symbol} HIT TP1 "
-                  f"+{result_pct:.1f}% ({elapsed_min:.0f}m)")
-            continue
-
-        if current_price <= rec["sl_price"]:
-            _close_record(rec, "loss_sl", current_price, now)
-            changed = True
-            _notify_outcome(rec, result_pct, "loss_sl")
-            print(f"[TRACKER] 🔴 {symbol} HIT SL "
-                  f"{result_pct:.1f}% ({elapsed_min:.0f}m)")
-            continue
-
-        # ── Expired ───────────────────────────────────
-        if elapsed_h >= TRACKER_MAX_OPEN_H:
-            _close_record(rec, "expired", current_price, now)
-            changed = True
-            _notify_outcome(rec, result_pct, "expired")
-            print(f"[TRACKER] ⏰ {symbol} EXPIRED "
-                  f"{result_pct:+.1f}% ({elapsed_h:.1f}h)")
-            continue
-
-        # Masih open
-        print(f"[TRACKER] ⏳ {symbol} open {elapsed_min:.0f}m "
-              f"| ${current_price:.8f} ({result_pct:+.1f}%)")
-
-    if changed:
-        _save_tracker()
 
 # ── TELEGRAM ─────────────────────────────────────────
 def send_telegram(message: str) -> bool:
@@ -528,6 +234,39 @@ def api_post(url: str, json_body: dict = None,
             print(f"[API POST ERR] {e}")
             break
     return None
+
+# ── SOL MARKET CONTEXT [V11-9] ───────────────────────
+def get_sol_context() -> float:
+    """
+    Ambil perubahan h1 SOL/USDC dari DexScreener.
+    Di-cache 5 menit. Return h1 change (float).
+    Suppress T0/T1 jika hasilnya < SOL_SUPPRESS_THRESHOLD.
+    """
+    now = time.time()
+    if now - _sol_context["ts"] < 300:
+        return _sol_context["h1"]
+    try:
+        r = api_get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}",
+            timeout=10)
+        if r and r.status_code == 200:
+            pairs = r.json().get("pairs", [])
+            # Ambil pair SOL/USDC atau SOL/USDT terbesar
+            sol_pairs = [p for p in pairs
+                         if p.get("quoteToken", {}).get("symbol", "")
+                         in ("USDC", "USDT", "USD")]
+            if sol_pairs:
+                best = sorted(sol_pairs,
+                              key=lambda x: x.get("volume", {}).get("h24", 0),
+                              reverse=True)[0]
+                h1 = float(best.get("priceChange", {}).get("h1", 0) or 0)
+                _sol_context["h1"] = h1
+                _sol_context["ts"] = now
+                print(f"[SOL CTX] h1={h1:+.1f}%")
+                return h1
+    except Exception as e:
+        print(f"[SOL CTX ERR] {e}")
+    return _sol_context["h1"]
 
 # ── DEX SCREENER ────────────────────────────────────
 def get_trending_tokens() -> list:
@@ -649,11 +388,14 @@ def get_rugcheck(token_address: str) -> dict:
         if r and r.status_code == 200:
             data = r.json()
 
-            # [B-5] Score normalisasi: bisa 0–1000, normalize ke 0–100
+            # [V11-1] Score normalisasi BENAR: Rugcheck kirim skala 0–1000.
+            # v10 hanya ÷10 jika > 100 — score 850 jadi 85 (dianggap aman, SALAH).
+            # Fix: selalu ÷10 jika raw_score > 10.
             raw_score = float(data.get("score", 0) or 0)
-            if raw_score > 100:
-                print(f"[RUGCHECK WARN] {token_address[:8]} "
-                      f"score raw={raw_score:.0f} → ÷10")
+            if raw_score > 10:
+                if raw_score > 100:
+                    print(f"[RUGCHECK WARN] {token_address[:8]} "
+                          f"score raw={raw_score:.0f} → ÷10")
                 raw_score = raw_score / 10
             score = min(int(raw_score), 100)
 
@@ -898,13 +640,16 @@ def check_temporal_filter(tier: str, m5: float, h1: float,
                           open_c1: float, price: float,
                           symbol: str) -> bool:
     """
-    F1: m5 > 150% = deteksi saat spike, bukan sebelumnya. Skip.
+    F1: m5 terlalu tinggi = deteksi saat spike, sudah terlambat. Skip.
+        [V11-6] T0 threshold diturunkan ke 50% (v10: 150% — terlalu longgar).
+        T0 MCAP kecil: m5 +80% biasanya sudah puncak pertama.
     F2: h1 < -30% + harga tembus C1 = distribusi aktif. Skip.
     Return True = lolos (lanjut), False = filtered (skip).
     """
-    # F1
-    if m5 > 150:
-        print(f"[F1 SKIP] {symbol} m5={m5:.1f}% > 150% — spike too late")
+    # F1 — threshold berbeda per tier
+    f1_threshold = 50.0 if tier == "T0" else 150.0
+    if m5 > f1_threshold:
+        print(f"[F1 SKIP] {symbol} m5={m5:.1f}% > {f1_threshold:.0f}% — spike too late")
         return False
 
     # F2 — hanya untuk T1+ (T0 tidak ada C1 yang reliable)
@@ -948,8 +693,15 @@ def check_hard_reject(gmgn: dict, rugcheck: dict,
         top10 = helius.get("top10_pct", 0)
         if top10 > HARD_REJECT_TOP10:
             return True, f"🔴 Top10 ekstrem: {top10:.0f}%!"
-        if helius.get("hub_spoke") and tier in ("T1", "T2", "T3"):
-            return True, "🔴 Hub & Spoke pada token established!"
+        if helius.get("hub_spoke"):
+            if tier in ("T1", "T2", "T3"):
+                return True, "🔴 Hub & Spoke pada token established!"
+            # [V11-5] T0: reject jika holders sedikit (distribusi sangat berisiko)
+            # v10 hanya -5 score untuk T0 — terlalu lunak untuk tier paling berisiko
+            if tier == "T0":
+                holders = gmgn.get("holders", 0) if gmgn.get("available") else 0
+                if holders < 50:
+                    return True, "🔴 Hub & Spoke + holders < 50 pada T0!"
 
     # Per-tier minimum — HANYA jika GMGN available
     if gmgn.get("available"):
@@ -1100,8 +852,14 @@ def score_safety(gmgn: dict, rugcheck: dict,
         elif top10 <= HARD_REJECT_TOP10:
             score -= 2; warnings.append(f"🔴 Top10 tinggi: {top10:.1f}%!")
 
-    # Safety bar (0–100), basis -15 sampai +35 → mapped ke 0–100
-    safety_pct = max(0, min(100, int((score + 15) / 50 * 100)))
+    # [V11-2] Safety bar dikalibrasi ulang.
+    # Range realistis score: min ≈ -10 (banyak penalti), max ≈ 38 (semua sinyal ada).
+    # v10 pakai (score+15)/50*100 → score 28 → 86%, terlalu optimistis.
+    # Fix: normalisasi ke range empiris -10..38, clamp 0–100.
+    SAFETY_MIN = -10
+    SAFETY_MAX = 38
+    safety_pct = max(0, min(100, int(
+        (score - SAFETY_MIN) / (SAFETY_MAX - SAFETY_MIN) * 100)))
     return score, signals, warnings, safety_pct
 
 # ── G6: T0 PRE-PUMP PATTERN SCORING ─────────────────
@@ -1322,18 +1080,56 @@ def get_tier(mcap: float, liq: float, vol_h1: float) -> str | None:
         return "T3"
     return None
 
-# ── DYNAMIC SL/TP ─────────────────────────────────────
-def get_sl_tp(price: float, tier: str) -> tuple:
-    sl_map  = {"T0": 0.80, "T1": 0.85, "T2": 0.88, "T3": 0.90}
-    tp1_map = {"T0": 3.0,  "T1": 2.0,  "T2": 1.8,  "T3": 1.5}
-    tp2_map = {"T0": 5.0,  "T1": 3.0,  "T2": 2.5,  "T3": 2.0}
-    sl_pct  = sl_map.get(tier, 0.85)
-    return (
-        price * sl_pct,
-        price * tp1_map.get(tier, 2.0),
-        price * tp2_map.get(tier, 3.0),
-        int((1 - sl_pct) * 100),
-    )
+# ── DYNAMIC SL/TP [V11-3] ────────────────────────────
+def get_sl_tp(price: float, tier: str,
+              dip_pct: float = 0.0, pump_pct: float = 0.0) -> tuple:
+    """
+    [V11-3] SL/TP dinamis berbasis konteks — v10 statis per tier.
+
+    SL: makin dalam dip sebelumnya → SL lebih longgar (token volatile).
+        Base SL per tier, lebar dikurangi 30% dari dip_pct aktual.
+        Min SL: 8%, Max SL: 30%.
+
+    TP: makin kuat pump awal → TP lebih tinggi (momentum ada).
+        Base TP per tier, dinaikkan proporsional pump_pct.
+        TP2 selalu ≥ 2× TP1 distance dari entry.
+
+    R:R minimum dijaga: (TP1 - entry) ≥ 1.5 × (entry - SL).
+    """
+    # Base SL per tier (persentase loss dari entry)
+    base_sl_pct = {"T0": 20, "T1": 15, "T2": 12, "T3": 10}.get(tier, 15)
+
+    # Pelebaran dinamis: dip dalam → SL lebih longgar, tapi max 30%
+    dip_adj    = min(dip_pct * 0.3, 10.0)   # max tambah 10%
+    sl_pct_raw = min(base_sl_pct + dip_adj, 30.0)
+    sl_pct     = max(sl_pct_raw, 8.0)
+
+    sl = price * (1 - sl_pct / 100)
+    sl_distance = price - sl   # positif
+
+    # Base TP multiplier per tier
+    base_tp1_r = {"T0": 2.5, "T1": 2.0, "T2": 1.8, "T3": 1.5}.get(tier, 2.0)
+    base_tp2_r = {"T0": 5.0, "T1": 3.5, "T2": 2.8, "T3": 2.2}.get(tier, 3.0)
+
+    # Bonus TP jika pump awal kuat
+    pump_bonus = 0.0
+    if pump_pct >= 500:   pump_bonus = 1.5
+    elif pump_pct >= 300: pump_bonus = 1.0
+    elif pump_pct >= 150: pump_bonus = 0.5
+
+    tp1_r = base_tp1_r + pump_bonus * 0.5
+    tp2_r = base_tp2_r + pump_bonus
+
+    tp1 = price * tp1_r
+    tp2 = price * tp2_r
+
+    # Guard R:R minimum 1.5 untuk TP1
+    min_tp1 = price + sl_distance * 1.5
+    if tp1 < min_tp1:
+        tp1 = min_tp1
+        tp2 = price + (tp1 - price) * 2.0   # TP2 = 2× TP1 distance
+
+    return sl, tp1, tp2, int(sl_pct)
 
 # ── MAIN ANALYZE ─────────────────────────────────────
 def analyze_pair(pair: dict) -> dict | None:
@@ -1382,8 +1178,16 @@ def analyze_pair(pair: dict) -> dict | None:
         if not check_pattern_exists(tier, m5, h1, h6, h24, vm5, vh1):
             return None
 
-        # Open C1 (dibutuhkan untuk G3 F2 check)
-        open_c1      = get_open_c1(addr, price)
+        # [V11-4] C1 dibaca saja untuk F2 check — belum ditulis.
+        # Penulisan C1 dipindah ke setelah G5 agar harga reject tidak tersimpan.
+        existing_entry = price_tracker.get(addr)
+        if existing_entry is None:
+            # Token baru: pakai harga sekarang sebagai estimasi C1 sementara
+            open_c1_preview = price
+        elif isinstance(existing_entry, dict):
+            open_c1_preview = existing_entry.get("price", price)
+        else:
+            open_c1_preview = float(existing_entry)
         tracked_high = get_tracked_high(addr)
 
         # [B-10] age_h_fallback clamp ≥ 0
@@ -1393,7 +1197,7 @@ def analyze_pair(pair: dict) -> dict | None:
         ) if pair_created else 0.0
 
         # ── G3: TEMPORAL FILTER F1 & F2 ───────────────
-        if not check_temporal_filter(tier, m5, h1, open_c1, price, symbol):
+        if not check_temporal_filter(tier, m5, h1, open_c1_preview, price, symbol):
             return None
 
         # ── G4: PANGGIL API ───────────────────────────
@@ -1414,6 +1218,9 @@ def analyze_pair(pair: dict) -> dict | None:
             if reason:
                 print(f"[HARD REJECT] {symbol} — {reason}")
             return None
+
+        # [V11-4] Token lolos G5 — baru tulis/update C1 yang valid
+        open_c1 = get_open_c1(addr, price)
 
         # ── G6: PATTERN SCORING (primer) ──────────────
         if tier == "T0":
@@ -1467,7 +1274,8 @@ def analyze_pair(pair: dict) -> dict | None:
 
         pos_map = {"T0": T0_MAX_POSITION, "T1": T1_MAX_POSITION,
                    "T2": T2_MAX_POSITION, "T3": T3_MAX_POSITION}
-        sl, tp1, tp2, sl_pct = get_sl_tp(price, tier)
+        # [V11-3] SL/TP dinamis — pakai konteks dip + pump
+        sl, tp1, tp2, sl_pct = get_sl_tp(price, tier, dip_pct, pump_pct)
         social = get_social(symbol, addr)
 
         # [B-11] Safety fields — None jika tidak tersedia
@@ -1675,8 +1483,9 @@ def format_alert(s: dict, is_update: bool = False) -> str:
 💰 <b>ENTRY ZONE:</b>
   Beli:        <b>${s['price']:.8f}</b>
   🔴 Stop Loss: <b>${s['sl']:.8f}</b> (-{s['sl_pct']}%)
-  🟡 Target 1:  <b>${s['tp1']:.8f}</b>
-  🟢 Target 2:  <b>${s['tp2']:.8f}</b>
+  🟡 Target 1:  <b>${s['tp1']:.8f}</b> — jual 50%
+  🟢 Target 2:  <b>${s['tp2']:.8f}</b> — jual sisanya
+  📌 R:R ≈ {round((s['tp1']-s['price'])/max(s['price']-s['sl'],0.000000001),1)}:1
 
 📊 Vol 24H: {vol24_t} | Liq: ${s['liq']/1000:.0f}K
 🔄 Buy/Sell h1: {bh1_ratio:.1f}x | m5: {bm5_ratio:.1f}x
@@ -1687,30 +1496,179 @@ def format_alert(s: dict, is_update: bool = False) -> str:
 ⚠️ BUKAN financial advice. DYOR!
 """.strip()
 
-# ── MAIN LOOP ─────────────────────────────────────────
-def scan_once():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning...")
-    trending = get_trending_tokens()
-    new_tok  = get_new_tokens()
+# ── EXIT ENGINE [V11-7] ──────────────────────────────
+def check_exits():
+    """
+    [V11-7] Periksa semua token yang sedang terbuka (ada di price_tracker
+    dengan entry_sl/entry_tp1/entry_tp2 tersimpan). Kirim alert jika:
+    - Harga saat ini < SL              → ⛔ STOP LOSS
+    - Harga saat ini > TP1 (sekali)    → 🟡 TP1 HIT — jual 50%
+    - Harga saat ini > TP2             → 🟢 TP2 HIT — jual sisanya
+    - Tracked high jauh di atas harga  → trailing SL otomatis update
+    """
+    if not price_tracker:
+        return
 
-    all_addr: set[str] = set()
-    for t in trending + new_tok:
-        a = t.get("tokenAddress", "") or t.get("address", "")
-        if a:
-            all_addr.add(a)
+    to_close = []
+    now      = time.time()
 
-    print(f"[SCAN] {len(all_addr)} token ditemukan")
-    t0 = t1 = t2 = t3 = 0
-    state_dirty = False
-    now = time.time()
+    for addr, entry in list(price_tracker.items()):
+        if not isinstance(entry, dict):
+            continue
+        # Hanya proses token yang punya SL/TP tersimpan
+        if "entry_sl" not in entry:
+            continue
 
-    for addr in list(all_addr)[:40]:
-        last_alert = alerted_tokens.get(addr, 0)
-        if now - last_alert < ALERT_COOLDOWN_SEC:
+        # Tidak cek token yang baru saja di-alert (< 2 menit)
+        alerted_ts = alerted_tokens.get(addr, 0)
+        if now - alerted_ts < 120:
             continue
 
         pair = get_pair(addr)
         if not pair:
+            continue
+
+        price_now = float(pair.get("priceUsd", 0) or 0)
+        if price_now <= 0:
+            continue
+
+        sl   = entry["entry_sl"]
+        tp1  = entry["entry_tp1"]
+        tp2  = entry["entry_tp2"]
+        sym  = entry.get("symbol", addr[:8])
+        tier = entry.get("tier",   "T?")
+
+        # Update trailing SL jika harga naik > 30% dari entry
+        entry_price = entry.get("entry_price", 0)
+        if entry_price > 0 and price_now > entry_price * 1.30:
+            new_trailing_sl = price_now * 0.85
+            if new_trailing_sl > sl:
+                old_sl = sl
+                price_tracker[addr]["entry_sl"] = new_trailing_sl
+                sl = new_trailing_sl
+                print(f"[TRAILING SL] {sym} SL update "
+                      f"${old_sl:.8f} → ${new_trailing_sl:.8f}")
+                send_telegram(
+                    f"🔄 <b>TRAILING SL UPDATE</b>\n\n"
+                    f"🪙 <b>{sym}</b> | {tier}\n"
+                    f"💹 Harga: <b>${price_now:.8f}</b>\n"
+                    f"🔴 SL baru: <b>${new_trailing_sl:.8f}</b>\n"
+                    f"📈 Profit saat ini: "
+                    f"<b>+{(price_now/entry_price - 1)*100:.1f}%</b>\n\n"
+                    f"⚡ SL dinaikkan otomatis untuk kunci profit!")
+
+        # Cek SL kena
+        if price_now <= sl:
+            pct = (price_now / entry_price - 1) * 100 if entry_price > 0 else 0
+            print(f"[SL HIT] {sym} ${price_now:.8f} ≤ SL ${sl:.8f}")
+            send_telegram(
+                f"⛔ <b>STOP LOSS HIT</b>\n\n"
+                f"🪙 <b>{sym}</b> | {tier}\n"
+                f"💹 Harga: <b>${price_now:.8f}</b>\n"
+                f"🔴 SL: <b>${sl:.8f}</b>\n"
+                f"📉 P&amp;L: <b>{pct:+.1f}%</b>\n\n"
+                f"⚠️ Keluar posisi sekarang!")
+            to_close.append(addr)
+            continue
+
+        # Cek TP2 kena
+        if price_now >= tp2 and not entry.get("tp2_hit"):
+            pct = (price_now / entry_price - 1) * 100 if entry_price > 0 else 0
+            print(f"[TP2 HIT] {sym} ${price_now:.8f} ≥ TP2 ${tp2:.8f}")
+            send_telegram(
+                f"🟢 <b>TARGET 2 TERCAPAI!</b>\n\n"
+                f"🪙 <b>{sym}</b> | {tier}\n"
+                f"💹 Harga: <b>${price_now:.8f}</b>\n"
+                f"🎯 TP2: <b>${tp2:.8f}</b>\n"
+                f"📈 P&amp;L: <b>+{pct:.1f}%</b> 🎉\n\n"
+                f"✅ Jual SEMUA sisa posisi!")
+            price_tracker[addr]["tp2_hit"] = True
+            to_close.append(addr)
+            continue
+
+        # Cek TP1 kena (hanya sekali)
+        if price_now >= tp1 and not entry.get("tp1_hit"):
+            pct = (price_now / entry_price - 1) * 100 if entry_price > 0 else 0
+            print(f"[TP1 HIT] {sym} ${price_now:.8f} ≥ TP1 ${tp1:.8f}")
+            send_telegram(
+                f"🟡 <b>TARGET 1 TERCAPAI!</b>\n\n"
+                f"🪙 <b>{sym}</b> | {tier}\n"
+                f"💹 Harga: <b>${price_now:.8f}</b>\n"
+                f"🎯 TP1: <b>${tp1:.8f}</b>\n"
+                f"📈 P&amp;L: <b>+{pct:.1f}%</b>\n\n"
+                f"💡 Jual <b>50%</b> posisi sekarang!\n"
+                f"🟢 Biarkan 50% sisanya jalan ke TP2: <b>${tp2:.8f}</b>")
+            price_tracker[addr]["tp1_hit"] = True
+
+    # Hapus token yang sudah ditutup dari tracker
+    for addr in to_close:
+        price_tracker.pop(addr, None)
+        alerted_tokens.pop(addr, None)
+    if to_close:
+        save_state()
+
+# ── MAIN LOOP ─────────────────────────────────────────
+def scan_once():
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning...")
+
+    # [V11-9] Cek kondisi pasar SOL terlebih dahulu
+    sol_h1 = get_sol_context()
+    sol_bearish = sol_h1 < SOL_SUPPRESS_THRESHOLD
+    if sol_bearish:
+        print(f"[SOL WARN] h1={sol_h1:+.1f}% — T0/T1 akan di-suppress")
+
+    # [V11-7] Jalankan exit engine sebelum scan token baru
+    check_exits()
+
+    trending = get_trending_tokens()
+    new_tok  = get_new_tokens()
+
+    # [V11-10] Prioritaskan trending, deduplikasi, lalu sort agar deterministik
+    trending_addrs = []
+    for t in trending:
+        a = t.get("tokenAddress", "") or t.get("address", "")
+        if a:
+            trending_addrs.append(a)
+
+    new_addrs = []
+    for t in new_tok:
+        a = t.get("tokenAddress", "") or t.get("address", "")
+        if a and a not in set(trending_addrs):
+            new_addrs.append(a)
+
+    # Trending diproses duluan, masing-masing sorted untuk determinisme
+    ordered_addrs = sorted(set(trending_addrs)) + sorted(set(new_addrs))
+
+    print(f"[SCAN] {len(ordered_addrs)} token ditemukan "
+          f"({len(trending_addrs)} trending + {len(new_addrs)} new)")
+
+    t0 = t1 = t2 = t3 = 0
+    state_dirty = False
+    now = time.time()
+
+    for addr in ordered_addrs[:50]:
+        # [V11-8] Cooldown per tier — ambil dari alerted_tokens dulu
+        last_alert = alerted_tokens.get(addr, 0)
+        # Pakai cooldown T1 sebagai default sebelum tier diketahui
+        if now - last_alert < ALERT_COOLDOWN_BY_TIER.get("T1", ALERT_COOLDOWN_SEC):
+            continue
+
+        pair = get_pair(addr)
+        if not pair:
+            continue
+
+        # [V11-8] Tentukan tier dari pair data untuk cooldown yang akurat
+        mcap_quick  = float(pair.get("marketCap", 0) or pair.get("fdv", 0) or 0)
+        liq_quick   = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+        vh1_quick   = float(pair.get("volume", {}).get("h1", 0) or 0)
+        tier_quick  = get_tier(mcap_quick, liq_quick, vh1_quick)
+        cooldown    = ALERT_COOLDOWN_BY_TIER.get(tier_quick or "T1", ALERT_COOLDOWN_SEC)
+        if now - last_alert < cooldown:
+            continue
+
+        # [V11-9] Suppress T0/T1 saat SOL bearish
+        if sol_bearish and tier_quick in ("T0", "T1"):
+            print(f"[SOL SUPPRESS] {addr[:8]} {tier_quick} — SOL h1={sol_h1:+.1f}%")
             continue
 
         signal = analyze_pair(pair)
@@ -1730,8 +1688,21 @@ def scan_once():
             # [B-9] Tandai dulu, simpan state terlepas dari Telegram
             alerted_tokens[addr] = now
             state_dirty          = True
-            if send_telegram(format_alert(signal, is_update)):
-                record_alert(signal)   # rekam ke tracker
+
+            # [V11-7] Simpan SL/TP ke price_tracker untuk exit engine
+            if addr in price_tracker and isinstance(price_tracker[addr], dict):
+                price_tracker[addr].update({
+                    "entry_price": signal["price"],
+                    "entry_sl":    signal["sl"],
+                    "entry_tp1":   signal["tp1"],
+                    "entry_tp2":   signal["tp2"],
+                    "symbol":      signal["symbol"],
+                    "tier":        signal["tier"],
+                    "tp1_hit":     False,
+                    "tp2_hit":     False,
+                })
+
+            send_telegram(format_alert(signal, is_update))
 
         time.sleep(0.5)
 
@@ -1739,19 +1710,17 @@ def scan_once():
     if state_dirty:
         save_state()
 
-    check_open_alerts()    # pantau outcome alert yang masih open
     print(f"[DONE] T0:{t0} T1:{t1} T2:{t2} T3:{t3}")
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v10.1 — WITH TRACKER")
+    print("  DIP & RIP BOT v11.0 — HARDENED BUILD")
     print("  Core: Token Aman + Dump Sehat + Second Pump")
-    print("  14 bug kritis diperbaiki | Tracker aktif")
+    print("  10 perbaikan v11 | Arsitektur 7 gate + Exit Engine")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY     else '⚠️  Belum ada key'}")
     print(f"  Lunar   : {'✅' if LUNARCRUSH_KEY else '⚠️  Belum ada key'}")
     print(f"  State   : {'✅ ' + str(STATE_FILE) if STATE_FILE.exists() else '🆕 Fresh start'}")
-    print(f"  Tracker : {'✅ ' + str(TRACKER_FILE) if TRACKER_FILE.exists() else '🆕 Fresh start'}")
     print(f"  T0 Pre-pump : ${T0_MIN_MCAP/1000:.0f}K–${T0_MAX_MCAP/1000:.0f}K")
     print(f"  T1 Early    : ${T1_MIN_MCAP/1000:.0f}K–${T1_MAX_MCAP/1000:.0f}K")
     print(f"  T2 Normal   : ${T2_MIN_MCAP/1000:.0f}K–${T2_MAX_MCAP/1000:.0f}K")
@@ -1759,16 +1728,24 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v10.1 aktif!</b>\n\n"
-        "🆕 <b>Tracker aktif:</b>\n"
-        "📸 Rekam setiap alert otomatis\n"
-        "⏱ Pantau outcome tiap 30 detik\n"
-        "🎯 Notif TP1/TP2/SL ke Telegram\n"
-        "📊 Data tersimpan di tracker.json\n\n"
-        "🏗️ <b>Arsitektur 7 gate:</b>\n"
+        "🤖 <b>DIP &amp; RIP Bot v11.0 aktif!</b>\n\n"
+        "🔧 <b>10 perbaikan v11:</b>\n\n"
+        "✅ [V11-1] Rugcheck score normalisasi benar (÷10 jika &gt;10)\n"
+        "✅ [V11-2] Safety% dikalibrasi ulang — tidak lagi over-optimis\n"
+        "✅ [V11-3] SL/TP dinamis berbasis dip &amp; pump aktual\n"
+        "✅ [V11-4] C1 dicatat hanya setelah lolos G5\n"
+        "✅ [V11-5] Hub&amp;Spoke T0 + holders &lt;50 = reject\n"
+        "✅ [V11-6] F1 threshold T0 diturunkan ke m5 &gt;50%\n"
+        "✅ [V11-7] Exit engine: SL/TP/Trailing alert otomatis\n"
+        "✅ [V11-8] Cooldown per tier: T0=10m T1=15m T2=20m T3=30m\n"
+        "✅ [V11-9] SOL context: T0/T1 di-suppress jika SOL h1 &lt;-5%\n"
+        "✅ [V11-10] Scan deterministik: trending dulu, sorted\n\n"
+        "🏗️ <b>Arsitektur 7 gate + Exit Engine:</b>\n"
         "G1 Basic → G2 Pattern → G3 F1/F2\n"
         "→ G4 API → G5 Hard reject\n"
-        "→ G6 Score → G7 Alert\n\n"
+        "→ G6 Score → G7 Alert\n"
+        "→ Exit Engine (TP1/TP2/SL/Trailing)\n\n"
+        f"🌐 LunarCrush: display only\n"
         "🚨 Scan setiap 30 detik!"
     )
 
