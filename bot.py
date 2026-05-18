@@ -5,6 +5,18 @@ import requests
 from datetime import datetime
 from pathlib import Path
 
+# ── EXECUTION ENGINE ─────────────────────────────────────────────────
+# Modul eksekusi: paper trade / live trading, risk guard, exit engine.
+# Pastikan execution_engine.py ada di direktori yang sama.
+try:
+    from execution_engine import ExecutionEngine
+    _engine = ExecutionEngine()
+    EXECUTION_ENABLED = True
+except ImportError:
+    EXECUTION_ENABLED = False
+    _engine = None
+    print("[EXEC] execution_engine.py tidak ditemukan — bot berjalan alert-only")
+
 # ══════════════════════════════════════════════════════════
 #   DIP & RIP BOT v11.0 — HARDENED BUILD
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
@@ -1353,7 +1365,7 @@ def format_alert(s: dict, is_update: bool = False) -> str:
     }
     temoji, tlabel, tdesc, tpos = tier_map.get(s["tier"], ("⚪", "", "", ""))
     grade_emoji = {"A+": "💎", "A": "🏆", "B": "🥈"}.get(s["grade"], "")
-    alert_label = "🔄 UPDATE v10.0!" if is_update else "🚨 DIP &amp; RIP ALERT v10.0!"
+    alert_label = "🔄 UPDATE v11.0!" if is_update else "🚨 DIP &amp; RIP ALERT v11.0!"
     mode_lbl    = "🔥 PRE-PUMP" if s["tier"] == "T0" else "📉 DIP &amp; RIP"
 
     signals_text = "\n".join(s["signals"]) if s["signals"] else "—"
@@ -1618,7 +1630,9 @@ def scan_once():
         print(f"[SOL WARN] h1={sol_h1:+.1f}% — T0/T1 akan di-suppress")
 
     # [V11-7] Jalankan exit engine sebelum scan token baru
-    check_exits()
+    check_exits()   # exit engine bawaan v11 (Telegram alert saja)
+    if EXECUTION_ENABLED and _engine:
+        _engine.run_exit_checks()  # exit engine baru (eksekusi on-chain)
 
     trending = get_trending_tokens()
     new_tok  = get_new_tokens()
@@ -1702,6 +1716,13 @@ def scan_once():
                     "tp2_hit":     False,
                 })
 
+            # ── EXECUTION ENGINE ─────────────────────────────────
+            # Kirim sinyal ke execution engine (paper atau live).
+            # Engine akan handle: risk check → order → position tracking.
+            # Telegram alert tetap dikirim di bawah sebagai log tambahan.
+            if EXECUTION_ENABLED and _engine and not is_update:
+                _engine.on_signal(signal)
+
             send_telegram(format_alert(signal, is_update))
 
         time.sleep(0.5)
@@ -1748,6 +1769,10 @@ def main():
         f"🌐 LunarCrush: display only\n"
         "🚨 Scan setiap 30 detik!"
     )
+
+    # Mulai execution engine (kill switch thread)
+    if EXECUTION_ENABLED and _engine:
+        _engine.start()
 
     while True:
         try:
