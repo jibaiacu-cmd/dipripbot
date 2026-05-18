@@ -204,6 +204,176 @@ def send_telegram(message: str) -> bool:
         print(f"[TELEGRAM ERR] {e}")
         return False
 
+# ── KILL SWITCH (built-in) ───────────────────────────
+# Mendengarkan command Telegram langsung di bot_v11.
+# Tidak bergantung pada execution_engine.py.
+#
+# Commands:
+#   /pause   — tahan sinyal baru (exit engine tetap jalan)
+#   /resume  — lanjut kirim sinyal
+#   /stop    — pause + ringkasan posisi terbuka
+#   /status  — ringkasan lengkap: posisi, P&L, saldo
+#   /balance — jumlah token yang sedang dipegang
+#   /help    — daftar semua command
+
+import threading as _threading
+
+_ks_offset  = 0          # last processed Telegram update_id
+_ks_running = False
+_bot_paused = False      # True = tahan sinyal baru
+
+def _ks_send(msg: str):
+    """Kirim pesan dari kill switch (non-blocking)."""
+    send_telegram(msg)
+
+def _ks_handle(text: str):
+    """Proses satu command dari Telegram."""
+    global _bot_paused
+    cmd = text.strip().lower().split()[0] if text.strip() else ""
+
+    if cmd == "/pause":
+        _bot_paused = True
+        _ks_send(
+            "⏸ <b>Bot di-pause</b>\n\n"
+            "Sinyal baru: <b>DITAHAN</b>\n"
+            "Exit engine (SL/TP/Trailing): tetap aktif\n\n"
+            "Kirim /resume untuk lanjut.")
+
+    elif cmd == "/resume":
+        _bot_paused = False
+        _ks_send("▶️ <b>Bot di-resume</b>\n\nSinyal baru: <b>AKTIF</b>")
+
+    elif cmd == "/stop":
+        _bot_paused = True
+        _ks_send(
+            f"🛑 <b>Bot di-STOP (pause)</b>\n\n"
+            f"{_ks_status_text()}\n\n"
+            "Kirim /resume untuk lanjut.")
+
+    elif cmd == "/status":
+        _ks_send(f"📊 <b>Status Bot</b>\n\n{_ks_status_text()}")
+
+    elif cmd == "/balance":
+        _ks_send(_ks_balance_text())
+
+    elif cmd == "/help":
+        _ks_send(
+            "🤖 <b>DipRip Bot v11 — Commands</b>\n\n"
+            "/status  — ringkasan posisi &amp; sinyal hari ini\n"
+            "/balance — token yang sedang dipantau\n"
+            "/pause   — tahan sinyal baru sementara\n"
+            "/resume  — lanjut kirim sinyal\n"
+            "/stop    — pause + lihat status\n"
+            "/help    — daftar command ini")
+
+def _ks_status_text() -> str:
+    """Teks ringkasan status untuk /status dan /stop."""
+    now        = time.time()
+    pause_str  = " | ⏸ PAUSED" if _bot_paused else ""
+
+    # Hitung token yang sedang dipantau (ada di price_tracker)
+    tracked = [
+        addr for addr, v in price_tracker.items()
+        if isinstance(v, dict) and v.get("entry_sl")
+    ]
+
+    # Hitung sinyal yang dikirim hari ini
+    today_start = time.time() - (time.time() % 86400)
+    today_alerts = sum(
+        1 for ts in alerted_tokens.values()
+        if ts >= today_start
+    )
+
+    # Posisi terbuka dari price_tracker
+    pos_lines = ""
+    for addr, v in list(price_tracker.items()):
+        if not isinstance(v, dict) or not v.get("entry_sl"):
+            continue
+        sym       = v.get("symbol", addr[:8])
+        tier      = v.get("tier",   "T?")
+        entry_p   = v.get("entry_price", 0)
+        sl        = v.get("entry_sl", 0)
+        tp1       = v.get("entry_tp1", 0)
+        tp1_hit   = v.get("tp1_hit", False)
+        tp2_hit   = v.get("tp2_hit", False)
+        status    = "✅TP1" if tp1_hit else ("🟢TP2" if tp2_hit else "⏳open")
+        pos_lines += (f"\n  • <b>{sym}</b> {tier} | "
+                      f"entry ${entry_p:.8f} | {status}")
+
+    return (
+        f"Mode: 🔔 Alert-only{pause_str}\n\n"
+        f"📡 Sinyal hari ini: <b>{today_alerts}</b>\n"
+        f"👁 Token dipantau: <b>{len(tracked)}</b>\n\n"
+        f"Posisi terbuka ({len(tracked)}):"
+        f"{pos_lines if pos_lines else chr(10) + '  (kosong)'}"
+    )
+
+def _ks_balance_text() -> str:
+    """Teks ringkasan token yang sedang dipantau untuk /balance."""
+    lines = []
+    for addr, v in list(price_tracker.items()):
+        if not isinstance(v, dict) or not v.get("entry_sl"):
+            continue
+        sym    = v.get("symbol", addr[:8])
+        tier   = v.get("tier", "T?")
+        entry  = v.get("entry_price", 0)
+        sl     = v.get("entry_sl", 0)
+        tp1    = v.get("entry_tp1", 0)
+        tp2    = v.get("entry_tp2", 0)
+        t1h    = "✅" if v.get("tp1_hit") else "⬜"
+        t2h    = "✅" if v.get("tp2_hit") else "⬜"
+        lines.append(
+            f"🪙 <b>{sym}</b> | {tier}\n"
+            f"   Entry: ${entry:.8f}\n"
+            f"   SL: ${sl:.8f}\n"
+            f"   TP1:{t1h} ${tp1:.8f}\n"
+            f"   TP2:{t2h} ${tp2:.8f}"
+        )
+    if not lines:
+        return "💼 <b>Tidak ada posisi terbuka saat ini.</b>"
+    header = f"💼 <b>Posisi terbuka ({len(lines)})</b>\n\n"
+    return header + "\n\n".join(lines)
+
+def _ks_poll():
+    """Poll Telegram getUpdates. Dipanggil di thread terpisah."""
+    global _ks_offset
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        return
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}"
+            f"/getUpdates?offset={_ks_offset}&timeout=2",
+            timeout=6)
+        if r.status_code != 200:
+            return
+        for upd in r.json().get("result", []):
+            _ks_offset = upd["update_id"] + 1
+            msg = upd.get("message", {})
+            # Hanya proses dari CHAT_ID yang diizinkan
+            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+                continue
+            text = (msg.get("text") or "").strip()
+            if text.startswith("/"):
+                print(f"[KS] Command: {text}")
+                _ks_handle(text)
+    except Exception as e:
+        print(f"[KS ERR] {e}")
+
+def _ks_loop():
+    """Loop thread kill switch — poll setiap 3 detik."""
+    global _ks_running
+    print("[KS] Kill switch aktif — mendengarkan /pause /resume /stop /status /balance /help")
+    while _ks_running:
+        _ks_poll()
+        time.sleep(3)
+
+def start_kill_switch():
+    """Start kill switch thread. Dipanggil dari main()."""
+    global _ks_running
+    _ks_running = True
+    t = _threading.Thread(target=_ks_loop, daemon=True, name="KillSwitch")
+    t.start()
+
 # ── API HELPERS ──────────────────────────────────────
 # [B-7] for-loop dengan continue eksplisit — Timeout tidak infinite
 def api_get(url: str, headers: dict = None, params: dict = None,
@@ -1716,14 +1886,14 @@ def scan_once():
                     "tp2_hit":     False,
                 })
 
-            # ── EXECUTION ENGINE ─────────────────────────────────
-            # Kirim sinyal ke execution engine (paper atau live).
-            # Engine akan handle: risk check → order → position tracking.
-            # Telegram alert tetap dikirim di bawah sebagai log tambahan.
-            if EXECUTION_ENABLED and _engine and not is_update:
-                _engine.on_signal(signal)
-
-            send_telegram(format_alert(signal, is_update))
+            # Kirim sinyal hanya jika tidak di-pause
+            if _bot_paused:
+                print(f"[KS] Paused — sinyal {signal['symbol']} ditahan")
+            else:
+                send_telegram(format_alert(signal, is_update))
+                # ── EXECUTION ENGINE ──────────────────────────────
+                if EXECUTION_ENABLED and _engine and not is_update:
+                    _engine.on_signal(signal)
 
         time.sleep(0.5)
 
@@ -1766,9 +1936,14 @@ def main():
         "→ G4 API → G5 Hard reject\n"
         "→ G6 Score → G7 Alert\n"
         "→ Exit Engine (TP1/TP2/SL/Trailing)\n\n"
+        "🎮 <b>Kill switch aktif:</b>\n"
+        "/status /balance /pause /resume /stop /help\n\n"
         f"🌐 LunarCrush: display only\n"
         "🚨 Scan setiap 30 detik!"
     )
+
+    # Mulai kill switch built-in (selalu aktif, tidak butuh execution_engine)
+    start_kill_switch()
 
     # Mulai execution engine (kill switch thread)
     if EXECUTION_ENABLED and _engine:
