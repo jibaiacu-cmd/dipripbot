@@ -478,7 +478,8 @@ def _ks_send(msg: str):
 def _ks_handle(text: str):
     """Proses satu command dari Telegram."""
     global _bot_paused
-    cmd = text.strip().lower().split()[0] if text.strip() else ""
+    cmd   = text.strip().lower().split()[0] if text.strip() else ""
+    parts = text.strip().lower().split()
 
     if cmd == "/pause":
         _bot_paused = True
@@ -505,15 +506,118 @@ def _ks_handle(text: str):
     elif cmd == "/balance":
         _ks_send(_ks_balance_text())
 
+    elif cmd == "/pnl":
+        # /pnl       → semua waktu
+        # /pnl 1     → hari ini
+        # /pnl 7     → 7 hari terakhir
+        # /pnl 30    → 30 hari terakhir
+        try:
+            days = int(parts[1]) if len(parts) > 1 else 0
+        except (ValueError, IndexError):
+            days = 0
+        _ks_send(_ks_pnl_text(days=days))
+
     elif cmd == "/help":
         _ks_send(
             "🤖 <b>DipRip Bot v11 — Commands</b>\n\n"
-            "/status  — ringkasan posisi &amp; sinyal hari ini\n"
-            "/balance — token yang sedang dipantau\n"
-            "/pause   — tahan sinyal baru sementara\n"
-            "/resume  — lanjut kirim sinyal\n"
-            "/stop    — pause + lihat status\n"
-            "/help    — daftar command ini")
+            "/status     — posisi, sinyal hari ini &amp; P&amp;L ringkas\n"
+            "/balance    — detail token yang dipantau\n"
+            "/pnl        — P&amp;L lengkap (semua waktu)\n"
+            "/pnl 1      — P&amp;L hari ini\n"
+            "/pnl 7      — P&amp;L 7 hari terakhir\n"
+            "/pnl 30     — P&amp;L 30 hari terakhir\n"
+            "/pause      — tahan sinyal baru sementara\n"
+            "/resume     — lanjut kirim sinyal\n"
+            "/stop       — pause + lihat status\n"
+            "/help       — daftar command ini")
+
+def _ks_pnl_text(days: int = 0) -> str:
+    """
+    Hitung P&L dari tracker_db.
+    days=0 → semua waktu. days=1 → hari ini. days=7 → 7 hari.
+    """
+    now         = time.time()
+    cutoff      = now - (days * 86400) if days > 0 else 0
+    today_start = now - (now % 86400)
+
+    # Filter alert yang sudah closed
+    closed = [
+        a for a in tracker_db.get("alerts", [])
+        if a.get("outcome") != "open"
+        and (a.get("alert_time", 0) >= cutoff if days > 0 else True)
+    ]
+    open_n = sum(
+        1 for a in tracker_db.get("alerts", [])
+        if a.get("outcome") == "open"
+    )
+    today_closed = [
+        a for a in closed
+        if a.get("alert_time", 0) >= today_start
+    ]
+
+    if not closed:
+        return (
+            f"📊 <b>P&amp;L Tracker</b>\n\n"
+            f"Open    : {open_n}\n"
+            f"Closed  : 0\n\n"
+            f"Belum ada data closed alert."
+        )
+
+    wins    = [a for a in closed if a.get("outcome", "").startswith("win")]
+    tp1     = [a for a in closed if a.get("outcome") == "win_tp1"]
+    tp2     = [a for a in closed if a.get("outcome") == "win_tp2"]
+    losses  = [a for a in closed if a.get("outcome") == "loss_sl"]
+    rugs    = [a for a in closed if a.get("outcome") == "rug_suspected"]
+    expired = [a for a in closed if a.get("outcome") == "expired"]
+
+    n        = len(closed)
+    win_rate = len(wins) / n * 100 if n > 0 else 0
+
+    results     = [a["result_pct"] for a in closed
+                   if a.get("result_pct") is not None]
+    win_results = [a["result_pct"] for a in wins
+                   if a.get("result_pct") is not None]
+    loss_results= [a["result_pct"] for a in losses
+                   if a.get("result_pct") is not None]
+
+    avg_r    = sum(results)      / len(results)       if results      else 0
+    avg_win  = sum(win_results)  / len(win_results)   if win_results  else 0
+    avg_loss = sum(loss_results) / len(loss_results)  if loss_results else 0
+
+    # Expectancy
+    wr  = win_rate / 100
+    exp = (wr * avg_win) + ((1 - wr) * avg_loss)
+
+    # Hari ini
+    today_wins   = [a for a in today_closed if a.get("outcome","").startswith("win")]
+    today_losses = [a for a in today_closed if a.get("outcome") == "loss_sl"]
+    today_res    = [a["result_pct"] for a in today_closed
+                    if a.get("result_pct") is not None]
+    today_avg    = sum(today_res) / len(today_res) if today_res else 0
+
+    # Emoji
+    wr_e   = "🟢" if win_rate >= 60 else "🟡" if win_rate >= 40 else "🔴"
+    exp_e  = "🟢" if exp > 0        else "🔴"
+    avg_e  = "🟢" if avg_r  > 0     else "🔴"
+    td_e   = "🟢" if today_avg > 0  else "🔴"
+
+    label  = "Semua waktu" if days == 0 else f"{days} hari terakhir"
+
+    return (
+        f"📊 <b>P&amp;L Tracker — {label}</b>\n\n"
+        f"<b>Total closed : {n}</b>  |  Open: {open_n}\n"
+        f"🎯 TP1: {len(tp1)}  🎯🎯 TP2: {len(tp2)}"
+        f"  🔴 SL: {len(losses)}  💀 Rug: {len(rugs)}  ⏰ Expired: {len(expired)}\n\n"
+        f"{wr_e} Win rate    : <b>{win_rate:.1f}%</b>\n"
+        f"{avg_e} Avg result  : <b>{avg_r:+.1f}%</b>\n"
+        f"📈 Avg win    : <b>{avg_win:+.1f}%</b>\n"
+        f"📉 Avg loss   : <b>{avg_loss:+.1f}%</b>\n"
+        f"{exp_e} Expectancy  : <b>{exp:+.1f}%</b> per trade\n\n"
+        f"<b>Hari ini:</b>  "
+        f"W:{len(today_wins)} L:{len(today_losses)} "
+        f"| Avg: {td_e} <b>{today_avg:+.1f}%</b>"
+    )
+
 
 def _ks_status_text() -> str:
     """Teks ringkasan status untuk /status dan /stop."""
@@ -527,7 +631,7 @@ def _ks_status_text() -> str:
     ]
 
     # Hitung sinyal yang dikirim hari ini
-    today_start = time.time() - (time.time() % 86400)
+    today_start  = time.time() - (time.time() % 86400)
     today_alerts = sum(
         1 for ts in alerted_tokens.values()
         if ts >= today_start
@@ -538,16 +642,17 @@ def _ks_status_text() -> str:
     for addr, v in list(price_tracker.items()):
         if not isinstance(v, dict) or not v.get("entry_sl"):
             continue
-        sym       = v.get("symbol", addr[:8])
-        tier      = v.get("tier",   "T?")
-        entry_p   = v.get("entry_price", 0)
-        sl        = v.get("entry_sl", 0)
-        tp1       = v.get("entry_tp1", 0)
-        tp1_hit   = v.get("tp1_hit", False)
-        tp2_hit   = v.get("tp2_hit", False)
-        status    = "✅TP1" if tp1_hit else ("🟢TP2" if tp2_hit else "⏳open")
+        sym     = v.get("symbol",       addr[:8])
+        tier    = v.get("tier",         "T?")
+        entry_p = v.get("entry_price",  0)
+        tp1_hit = v.get("tp1_hit",      False)
+        tp2_hit = v.get("tp2_hit",      False)
+        status  = "✅TP1" if tp1_hit else ("🟢TP2" if tp2_hit else "⏳open")
         pos_lines += (f"\n  • <b>{sym}</b> {tier} | "
                       f"entry ${entry_p:.8f} | {status}")
+
+    # P&L ringkas dari tracker
+    pnl_section = "\n\n" + _ks_pnl_text(days=0)
 
     return (
         f"Mode: 🔔 Alert-only{pause_str}\n\n"
@@ -555,6 +660,7 @@ def _ks_status_text() -> str:
         f"👁 Token dipantau: <b>{len(tracked)}</b>\n\n"
         f"Posisi terbuka ({len(tracked)}):"
         f"{pos_lines if pos_lines else chr(10) + '  (kosong)'}"
+        f"{pnl_section}"
     )
 
 def _ks_balance_text() -> str:
