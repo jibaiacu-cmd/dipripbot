@@ -18,8 +18,15 @@ except ImportError:
     print("[EXEC] execution_engine.py tidak ditemukan — bot berjalan alert-only")
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v11.0 — HARDENED BUILD
+#   DIP & RIP BOT v11.1 — HARDENED + LOG FIXES
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
+#
+#   FIX DARI ANALISIS LOG (v11.0 → v11.1):
+#   [LOG-FIX-1] hard_reject_cache — token GAM/KING tidak dievaluasi
+#               ulang setiap siklus. TTL 60 menit = hemat ratusan API call.
+#   [LOG-FIX-2] Tracker diport dari v10.1 — record_alert() +
+#               check_open_alerts(). TRACKER_NOTIFY_OUTCOME=False
+#               agar tidak duplikat dengan check_exits().
 #
 #   ARSITEKTUR 7 GATE (urutan tidak bisa diubah):
 #   G1  Basic filter          — 0 API call
@@ -189,6 +196,248 @@ rugcheck_cache = {}
 helius_cache   = {}
 social_cache   = {}
 CACHE_SEC      = 300
+
+# ── HARD REJECT CACHE ────────────────────────────────
+# [LOG-FIX-1] Token yang hard reject (freeze/mint/honeypot/hub&spoke)
+# dievaluasi ulang setiap siklus meski selalu ditolak — buang API call.
+# Solusi: cache hasil reject selama 60 menit.
+# Hanya token dengan reason eksplisit (bukan sekadar age/holders) yang
+# masuk cache — supaya token yang belum mature tetap dicoba lagi nanti.
+hard_reject_cache = {}   # addr → (reason: str, timestamp: float)
+HARD_REJECT_TTL   = 3600 # 60 menit
+
+# ── TRACKER ──────────────────────────────────────────
+# [LOG-FIX-2] Tracker dari v10.1 — diport ke v11.
+# TRACKER_NOTIFY_OUTCOME = False karena check_exits() sudah
+# menangani notifikasi TP/SL via Telegram. Jangan kirim duplikat.
+TRACKER_FILE           = Path("tracker.json")
+TRACKER_MAX_OPEN_H     = 4
+TRACKER_CHECK_MINS     = [30, 60, 240]
+TRACKER_NOTIFY_OUTCOME = False  # check_exits() sudah handle ini
+
+def _load_tracker() -> dict:
+    if TRACKER_FILE.exists():
+        try:
+            with open(TRACKER_FILE, "r") as f:
+                data = json.load(f)
+            open_n = sum(1 for a in data.get("alerts", [])
+                         if a.get("outcome") == "open")
+            print(f"[TRACKER] Loaded: "
+                  f"{len(data.get('alerts', []))} total, "
+                  f"{open_n} open")
+            return data
+        except Exception as e:
+            print(f"[TRACKER ERR] Load gagal: {e} — fresh start")
+    return {"alerts": []}
+
+def _save_tracker():
+    try:
+        with open(TRACKER_FILE, "w") as f:
+            json.dump(tracker_db, f, indent=2)
+    except Exception as e:
+        print(f"[TRACKER ERR] Save gagal: {e}")
+
+tracker_db = _load_tracker()
+
+def record_alert(signal: dict):
+    """Rekam snapshot alert ke tracker.json. Jangan duplikasi record open."""
+    now = time.time()
+    for existing in tracker_db["alerts"]:
+        if (existing.get("addr")    == signal["addr"]
+                and existing.get("outcome") == "open"):
+            return
+
+    record = {
+        "addr":           signal["addr"],
+        "symbol":         signal["symbol"],
+        "name":           signal["name"],
+        "tier":           signal["tier"],
+        "grade":          signal["grade"],
+        "alert_time":     now,
+        "alert_time_str": time.strftime("%Y-%m-%d %H:%M:%S",
+                                        time.localtime(now)),
+        "entry_price": signal["price"],
+        "open_c1":     signal["open_c1"],
+        "sl_price":    signal["sl"],
+        "tp1_price":   signal["tp1"],
+        "tp2_price":   signal["tp2"],
+        "sl_pct":      signal["sl_pct"],
+        "pump_pct":    signal["pump_pct"],
+        "dip_pct":     signal["dip_pct"],
+        "holds_c1":    signal["holds_c1"],
+        "m5":          signal["m5"],
+        "h1":          signal["h1"],
+        "h6":          signal["h6"],
+        "h24":         signal["h24"],
+        "score":       signal["total"],
+        "safety_pct":  signal["safety_pct"],
+        "lp_burned":      signal.get("lp_burned"),
+        "bundle_pct":     signal.get("bundle_pct"),
+        "dev_burned_pct": signal.get("dev_burned_pct"),
+        "holders":        signal.get("holders"),
+        "sniper_count":   signal.get("sniper_count"),
+        "rc_score":       signal.get("rc_score", 0),
+        "rc_risks":       signal.get("rc_risks", 0),
+        "mcap":  signal["mcap"],
+        "liq":   signal["liq"],
+        "vh24":  signal["vh24"],
+        "chart": signal["chart"],
+        "outcome":            "open",
+        "outcome_time":       None,
+        "outcome_time_str":   None,
+        "minutes_to_outcome": None,
+        "price_30m":  None,
+        "price_60m":  None,
+        "price_240m": None,
+        "max_price_seen": signal["price"],
+        "max_gain_pct":   0.0,
+        "result_pct":     None,
+    }
+    tracker_db["alerts"].append(record)
+    _save_tracker()
+    print(f"[TRACKER] ✅ {signal['symbol']} "
+          f"{signal['tier']}/{signal['grade']} "
+          f"entry=${signal['price']:.8f}")
+
+def _get_tracker_price(addr: str) -> float | None:
+    """Ambil harga token dari DexScreener untuk tracker."""
+    try:
+        r = api_get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+            timeout=10)
+        if not r or r.status_code != 200:
+            return None
+        pairs = r.json().get("pairs", [])
+        if not pairs:
+            return None
+        best  = sorted(pairs,
+                       key=lambda x: x.get("volume", {}).get("h24", 0),
+                       reverse=True)[0]
+        price = float(best.get("priceUsd", 0) or 0)
+        return price if price > 0 else None
+    except Exception as e:
+        print(f"[TRACKER PRICE ERR] {addr[:8]}: {e}")
+        return None
+
+def _close_record(rec: dict, outcome: str,
+                  close_price: float, now: float):
+    entry      = rec["entry_price"]
+    result_pct = (
+        (close_price - entry) / entry * 100
+        if entry > 0 and close_price > 0 else -100.0
+    )
+    rec["outcome"]             = outcome
+    rec["outcome_time"]        = now
+    rec["outcome_time_str"]    = time.strftime(
+        "%Y-%m-%d %H:%M:%S", time.localtime(now))
+    rec["minutes_to_outcome"]  = round((now - rec["alert_time"]) / 60, 1)
+    rec["result_pct"]          = round(result_pct, 2)
+    if rec.get("price_240m") is None:
+        rec["price_240m"] = close_price if close_price > 0 else None
+
+def _notify_outcome(rec: dict, result_pct: float, outcome: str):
+    """TRACKER_NOTIFY_OUTCOME = False di v11 — check_exits() sudah handle."""
+    if not TRACKER_NOTIFY_OUTCOME:
+        return
+    label_map = {
+        "win_tp2": "🎯🎯 TP2 TERCAPAI!",
+        "win_tp1": "🎯 TP1 tercapai",
+        "loss_sl": "🔴 Stop Loss",
+        "rug_suspected": "💀 Rug suspected",
+        "expired": "⏰ Expired (4 jam)",
+    }
+    sign = "+" if result_pct >= 0 else ""
+    send_telegram(
+        f"📊 <b>TRACKER</b> {label_map.get(outcome, outcome)}\n"
+        f"🪙 <b>{rec['symbol']}</b> {rec['tier']}/{rec['grade']}\n"
+        f"⏱ {rec.get('minutes_to_outcome', 0):.0f} menit | "
+        f"<b>{sign}{result_pct:.1f}%</b>\n"
+        f"🔗 <a href=\"{rec['chart']}\">Chart</a>"
+    )
+
+def check_open_alerts():
+    """
+    Cek harga terbaru untuk semua alert tracker yang masih open.
+    Dipanggil di akhir scan_once(). Tidak kirim Telegram (check_exits() sudah).
+    Hanya catat outcome dan snapshot ke tracker.json.
+    """
+    now       = time.time()
+    open_recs = [a for a in tracker_db["alerts"]
+                 if a.get("outcome") == "open"]
+    if not open_recs:
+        return
+
+    print(f"[TRACKER] Checking {len(open_recs)} open...")
+    changed = False
+
+    for rec in open_recs:
+        addr        = rec["addr"]
+        symbol      = rec["symbol"]
+        entry       = rec["entry_price"]
+        alert_time  = rec["alert_time"]
+        elapsed_min = (now - alert_time) / 60
+        elapsed_h   = elapsed_min / 60
+
+        current = _get_tracker_price(addr)
+
+        if current is None:
+            if elapsed_h >= 0.5:
+                _close_record(rec, "rug_suspected", 0.0, now)
+                _notify_outcome(rec, -100.0, "rug_suspected")
+                changed = True
+                print(f"[TRACKER] 💀 {symbol} rug suspected")
+            continue
+
+        # Update max price
+        if current > rec.get("max_price_seen", entry):
+            rec["max_price_seen"] = current
+            if entry > 0:
+                rec["max_gain_pct"] = round(
+                    (current - entry) / entry * 100, 2)
+            changed = True
+
+        # Snapshot di menit tertentu
+        for mins in TRACKER_CHECK_MINS:
+            key = f"price_{mins}m"
+            if rec.get(key) is None and elapsed_min >= mins:
+                rec[key] = current
+                changed  = True
+                print(f"[TRACKER] 📸 {symbol} {mins}m=${current:.8f}")
+
+        # Result pct sekarang
+        result_pct = (current - entry) / entry * 100 if entry > 0 else 0.0
+
+        # Cek outcome (TP2 dulu)
+        if current >= rec["tp2_price"]:
+            _close_record(rec, "win_tp2", current, now)
+            _notify_outcome(rec, result_pct, "win_tp2")
+            changed = True
+            print(f"[TRACKER] 🎯🎯 {symbol} TP2 +{result_pct:.1f}%")
+            continue
+        if current >= rec["tp1_price"]:
+            _close_record(rec, "win_tp1", current, now)
+            _notify_outcome(rec, result_pct, "win_tp1")
+            changed = True
+            print(f"[TRACKER] 🎯 {symbol} TP1 +{result_pct:.1f}%")
+            continue
+        if current <= rec["sl_price"]:
+            _close_record(rec, "loss_sl", current, now)
+            _notify_outcome(rec, result_pct, "loss_sl")
+            changed = True
+            print(f"[TRACKER] 🔴 {symbol} SL {result_pct:.1f}%")
+            continue
+        if elapsed_h >= TRACKER_MAX_OPEN_H:
+            _close_record(rec, "expired", current, now)
+            _notify_outcome(rec, result_pct, "expired")
+            changed = True
+            print(f"[TRACKER] ⏰ {symbol} expired {result_pct:+.1f}%")
+            continue
+
+        print(f"[TRACKER] ⏳ {symbol} {elapsed_min:.0f}m "
+              f"${current:.8f} ({result_pct:+.1f}%)")
+
+    if changed:
+        _save_tracker()
 
 # ── TELEGRAM ─────────────────────────────────────────
 def send_telegram(message: str) -> bool:
@@ -570,10 +819,14 @@ def get_rugcheck(token_address: str) -> dict:
         if r and r.status_code == 200:
             data = r.json()
 
-            # [V11-1] Score normalisasi BENAR: Rugcheck kirim skala 0–1000.
-            # v10 hanya ÷10 jika > 100 — score 850 jadi 85 (dianggap aman, SALAH).
-            # Fix: selalu ÷10 jika raw_score > 10.
+            # [V11-1] Score normalisasi: Rugcheck kirim skala 0–1000.
+            # ÷10 jika raw > 10. Untuk anomali ekstrem (> 10.000),
+            # log warn tambahan agar terdeteksi jika skala API berubah.
             raw_score = float(data.get("score", 0) or 0)
+            if raw_score > 10_000:
+                print(f"[RUGCHECK WARN] {token_address[:8]} "
+                      f"score raw={raw_score:.0f} — SANGAT BESAR, "
+                      f"kemungkinan skala API berubah")
             if raw_score > 10:
                 if raw_score > 100:
                     print(f"[RUGCHECK WARN] {token_address[:8]} "
@@ -1399,6 +1652,8 @@ def analyze_pair(pair: dict) -> dict | None:
         if rejected:
             if reason:
                 print(f"[HARD REJECT] {symbol} — {reason}")
+                # [LOG-FIX-1] Cache token berbahaya — skip 60 menit ke depan
+                hard_reject_cache[addr] = (reason, time.time())
             return None
 
         # [V11-4] Token lolos G5 — baru tulis/update C1 yang valid
@@ -1831,6 +2086,16 @@ def scan_once():
     now = time.time()
 
     for addr in ordered_addrs[:50]:
+        now = time.time()
+
+        # [LOG-FIX-1] Cek hard reject cache sebelum ANY API call
+        cached_reject = hard_reject_cache.get(addr)
+        if cached_reject:
+            if now - cached_reject[1] < HARD_REJECT_TTL:
+                continue   # masih dalam TTL — skip tanpa API call
+            else:
+                del hard_reject_cache[addr]  # expired — retry
+
         # [V11-8] Cooldown per tier — ambil dari alerted_tokens dulu
         last_alert = alerted_tokens.get(addr, 0)
         # Pakai cooldown T1 sebagai default sebelum tier diketahui
@@ -1890,7 +2155,10 @@ def scan_once():
             if _bot_paused:
                 print(f"[KS] Paused — sinyal {signal['symbol']} ditahan")
             else:
-                send_telegram(format_alert(signal, is_update))
+                if send_telegram(format_alert(signal, is_update)):
+                    # [LOG-FIX-2] Rekam ke tracker hanya jika Telegram berhasil
+                    if not is_update:
+                        record_alert(signal)
                 # ── EXECUTION ENGINE ──────────────────────────────
                 if EXECUTION_ENABLED and _engine and not is_update:
                     _engine.on_signal(signal)
@@ -1901,17 +2169,20 @@ def scan_once():
     if state_dirty:
         save_state()
 
+    # [LOG-FIX-2] Pantau outcome alert tracker yang masih open
+    check_open_alerts()
     print(f"[DONE] T0:{t0} T1:{t1} T2:{t2} T3:{t3}")
 
 def main():
     print("=" * 60)
-    print("  DIP & RIP BOT v11.0 — HARDENED BUILD")
+    print("  DIP & RIP BOT v11.1 — HARDENED + LOG FIXES")
     print("  Core: Token Aman + Dump Sehat + Second Pump")
-    print("  10 perbaikan v11 | Arsitektur 7 gate + Exit Engine")
+    print("  10 fix v11 + 2 fix dari analisis log")
     print("=" * 60)
     print(f"  Helius  : {'✅' if HELIUS_KEY     else '⚠️  Belum ada key'}")
     print(f"  Lunar   : {'✅' if LUNARCRUSH_KEY else '⚠️  Belum ada key'}")
-    print(f"  State   : {'✅ ' + str(STATE_FILE) if STATE_FILE.exists() else '🆕 Fresh start'}")
+    print(f"  State   : {'✅ ' + str(STATE_FILE)   if STATE_FILE.exists()   else '🆕 Fresh start'}")
+    print(f"  Tracker : {'✅ ' + str(TRACKER_FILE) if TRACKER_FILE.exists() else '🆕 Fresh start'}")
     print(f"  T0 Pre-pump : ${T0_MIN_MCAP/1000:.0f}K–${T0_MAX_MCAP/1000:.0f}K")
     print(f"  T1 Early    : ${T1_MIN_MCAP/1000:.0f}K–${T1_MAX_MCAP/1000:.0f}K")
     print(f"  T2 Normal   : ${T2_MIN_MCAP/1000:.0f}K–${T2_MAX_MCAP/1000:.0f}K")
@@ -1919,26 +2190,18 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v11.0 aktif!</b>\n\n"
-        "🔧 <b>10 perbaikan v11:</b>\n\n"
-        "✅ [V11-1] Rugcheck score normalisasi benar (÷10 jika &gt;10)\n"
-        "✅ [V11-2] Safety% dikalibrasi ulang — tidak lagi over-optimis\n"
-        "✅ [V11-3] SL/TP dinamis berbasis dip &amp; pump aktual\n"
-        "✅ [V11-4] C1 dicatat hanya setelah lolos G5\n"
-        "✅ [V11-5] Hub&amp;Spoke T0 + holders &lt;50 = reject\n"
-        "✅ [V11-6] F1 threshold T0 diturunkan ke m5 &gt;50%\n"
-        "✅ [V11-7] Exit engine: SL/TP/Trailing alert otomatis\n"
-        "✅ [V11-8] Cooldown per tier: T0=10m T1=15m T2=20m T3=30m\n"
-        "✅ [V11-9] SOL context: T0/T1 di-suppress jika SOL h1 &lt;-5%\n"
-        "✅ [V11-10] Scan deterministik: trending dulu, sorted\n\n"
+        "🤖 <b>DIP &amp; RIP Bot v11.1 aktif!</b>\n\n"
+        "🔧 <b>Fix dari analisis log:</b>\n"
+        "✅ [LOG-1] Hard reject cache — token berbahaya\n"
+        "   di-skip 60 menit tanpa API call\n"
+        "✅ [LOG-2] Tracker aktif — record + outcome\n"
+        "   (silent, tidak duplikat exit alert)\n\n"
         "🏗️ <b>Arsitektur 7 gate + Exit Engine:</b>\n"
         "G1 Basic → G2 Pattern → G3 F1/F2\n"
         "→ G4 API → G5 Hard reject\n"
         "→ G6 Score → G7 Alert\n"
         "→ Exit Engine (TP1/TP2/SL/Trailing)\n\n"
-        "🎮 <b>Kill switch aktif:</b>\n"
-        "/status /balance /pause /resume /stop /help\n\n"
-        f"🌐 LunarCrush: display only\n"
+        "🎮 <b>Kill switch:</b> /status /balance /pause /resume /stop /help\n\n"
         "🚨 Scan setiap 30 detik!"
     )
 
