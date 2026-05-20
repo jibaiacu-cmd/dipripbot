@@ -648,8 +648,15 @@ def _ks_pnl_text(days: int = 0) -> str:
 
 def _ks_status_text() -> str:
     """Teks ringkasan status untuk /status dan /stop."""
-    now        = time.time()
-    pause_str  = " | ⏸ PAUSED" if _bot_paused else ""
+    now       = time.time()
+    pause_str = " | ⏸ PAUSED" if _bot_paused else ""
+
+    # Sinyal hari ini
+    today_start  = now - (now % 86400)
+    today_alerts = sum(
+        1 for ts in alerted_tokens.values()
+        if ts >= today_start
+    )
 
     # Open dari tracker_db (source of truth untuk P&L)
     tracker_open = [
