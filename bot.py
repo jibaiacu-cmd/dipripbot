@@ -18,16 +18,17 @@ except ImportError:
     print("[EXEC] execution_engine.py tidak ditemukan — bot berjalan alert-only")
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v11.3 — DATA-DRIVEN FILTER
+#   DIP & RIP BOT v11.4 — STABILITY FIXES
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
 #
-#   FIX DARI DATA 86 ALERT (v11.2 → v11.3):
-#   [DATA-FIX-1] Grade B dihapus semua tier — hanya A dan A+.
-#                Data nyata: Grade B win rate sangat rendah.
-#   [DATA-FIX-2] Hard reject: Rugcheck < 40 + no-data T0/T1 reject.
-#                Rug rate 27.9% — filter keamanan diperketat.
-#   [DATA-FIX-3] /status open count dari dua sumber ditampilkan
-#                eksplisit — tidak ada discrepancy membingungkan.
+#   FIX v11.4:
+#   [FIX-DIV0]    calc_dip_from_high: guard change_h1 <= -100
+#                 (hard rug → ZeroDivisionError → crash loop)
+#   [FIX-STATE]   check_exits: state_changed flag — save_state
+#                 dipanggil saat tp1_hit dan trailing SL update,
+#                 bukan hanya saat posisi ditutup. Cegah spam TP1.
+#   [FIX-MEMLEAK] clean_caches() — hapus entry kedaluwarsa setiap
+#                 scan. Cegah OOM crash pada runtime 24/7.
 #
 #   ARSITEKTUR 7 GATE (urutan tidak bisa diubah):
 #   G1  Basic filter          — 0 API call
@@ -1170,10 +1171,15 @@ def calc_dip_from_high(price: float, tracked_high: float,
                        change_h1: float, change_m5: float) -> float:
     """
     Priority: tracked_high (akurat) > estimasi h1 > estimasi m5.
+    [FIX-DIV0] change_h1 = -100.0 (hard rug) → 1 + (-100/100) = 0
+                → ZeroDivisionError. Guard: kembalikan 100.0 langsung.
     """
     if tracked_high > 0 and price < tracked_high:
         return ((tracked_high - price) / tracked_high) * 100
     if change_h1 < 0:
+        # [FIX-DIV0] hard rug: change_h1 <= -100 → denominator = 0
+        if change_h1 <= -100.0:
+            return 100.0
         est_high = price / (1 + change_h1 / 100)
         return ((est_high - price) / est_high) * 100
     if change_m5 < 0:
@@ -2100,8 +2106,9 @@ def check_exits():
     if not price_tracker:
         return
 
-    to_close = []
-    now      = time.time()
+    to_close      = []
+    state_changed = False   # [FIX-STATE] track mutasi selain to_close
+    now           = time.time()
 
     for addr, entry in list(price_tracker.items()):
         if not isinstance(entry, dict):
@@ -2136,7 +2143,8 @@ def check_exits():
             if new_trailing_sl > sl:
                 old_sl = sl
                 price_tracker[addr]["entry_sl"] = new_trailing_sl
-                sl = new_trailing_sl
+                sl            = new_trailing_sl
+                state_changed = True   # [FIX-STATE] trailing SL = mutasi state
                 print(f"[TRAILING SL] {sym} SL update "
                       f"${old_sl:.8f} → ${new_trailing_sl:.8f}")
                 send_telegram(
@@ -2195,17 +2203,39 @@ def check_exits():
                 f"💡 Jual <b>50%</b> posisi sekarang!\n"
                 f"🟢 Biarkan 50% sisanya jalan ke TP2: <b>${tp2:.8f}</b>")
             price_tracker[addr]["tp1_hit"] = True
+            state_changed = True   # [FIX-STATE] tp1_hit harus tersimpan
             # Tracker TIDAK di-sync di sini — posisi masih terbuka 50%
 
     # Hapus token yang sudah ditutup dari tracker
     for addr in to_close:
         price_tracker.pop(addr, None)
         alerted_tokens.pop(addr, None)
-    if to_close:
+
+    # [FIX-STATE] Simpan jika ada mutasi apapun — bukan hanya saat posisi ditutup
+    # Tanpa ini: tp1_hit = True dan trailing SL update hilang saat bot restart
+    if to_close or state_changed:
         save_state()
 
 # ── MAIN LOOP ─────────────────────────────────────────
+def clean_caches():
+    """
+    [FIX-MEMLEAK] Hapus entry cache yang sudah kedaluwarsa.
+    Cache punya logic 'jangan baca yang expired' tapi tidak pernah
+    menghapus data lama dari RAM. Pada runtime 24/7, dict cache
+    tumbuh terus → OOM crash dalam beberapa hari.
+    Dipanggil di awal setiap scan_once() — overhead sangat kecil.
+    """
+    now = time.time()
+    for cache in [gmgn_cache, rugcheck_cache, helius_cache, social_cache]:
+        stale = [k for k, v in cache.items()
+                 if now - v[0] > CACHE_SEC]
+        for k in stale:
+            del cache[k]
+    if stale:   # log hanya jika ada yang dibersihkan
+        print(f"[CACHE GC] {len(stale)} entry kedaluwarsa dihapus")
+
 def scan_once():
+    clean_caches()   # [FIX-MEMLEAK] bersihkan cache kedaluwarsa sebelum scan
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning...")
 
     # [V11-9] Cek kondisi pasar SOL terlebih dahulu
