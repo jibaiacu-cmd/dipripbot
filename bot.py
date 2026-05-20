@@ -18,15 +18,16 @@ except ImportError:
     print("[EXEC] execution_engine.py tidak ditemukan — bot berjalan alert-only")
 
 # ══════════════════════════════════════════════════════════
-#   DIP & RIP BOT v11.1 — HARDENED + LOG FIXES
+#   DIP & RIP BOT v11.3 — DATA-DRIVEN FILTER
 #   Core Philosophy: Token Aman + Dump Sehat + Second Pump
 #
-#   FIX DARI ANALISIS LOG (v11.0 → v11.1):
-#   [LOG-FIX-1] hard_reject_cache — token GAM/KING tidak dievaluasi
-#               ulang setiap siklus. TTL 60 menit = hemat ratusan API call.
-#   [LOG-FIX-2] Tracker diport dari v10.1 — record_alert() +
-#               check_open_alerts(). TRACKER_NOTIFY_OUTCOME=False
-#               agar tidak duplikat dengan check_exits().
+#   FIX DARI DATA 86 ALERT (v11.2 → v11.3):
+#   [DATA-FIX-1] Grade B dihapus semua tier — hanya A dan A+.
+#                Data nyata: Grade B win rate sangat rendah.
+#   [DATA-FIX-2] Hard reject: Rugcheck < 40 + no-data T0/T1 reject.
+#                Rug rate 27.9% — filter keamanan diperketat.
+#   [DATA-FIX-3] /status open count dari dua sumber ditampilkan
+#                eksplisit — tidak ada discrepancy membingungkan.
 #
 #   ARSITEKTUR 7 GATE (urutan tidak bisa diubah):
 #   G1  Basic filter          — 0 API call
@@ -340,11 +341,12 @@ def _notify_outcome(rec: dict, result_pct: float, outcome: str):
     if not TRACKER_NOTIFY_OUTCOME:
         return
     label_map = {
-        "win_tp2": "🎯🎯 TP2 TERCAPAI!",
-        "win_tp1": "🎯 TP1 tercapai",
-        "loss_sl": "🔴 Stop Loss",
-        "rug_suspected": "💀 Rug suspected",
-        "expired": "⏰ Expired (4 jam)",
+        "win_tp2":          "🎯🎯 TP2 TERCAPAI!",
+        "win_tp1":          "🎯 TP1 tercapai",
+        "win_trailing_sl":  "✅ Profit terkunci via trailing SL",
+        "loss_sl":          "🔴 Stop Loss",
+        "rug_suspected":    "💀 Rug suspected",
+        "expired":          "⏰ Expired (4 jam)",
     }
     sign = "+" if result_pct >= 0 else ""
     send_telegram(
@@ -354,6 +356,29 @@ def _notify_outcome(rec: dict, result_pct: float, outcome: str):
         f"<b>{sign}{result_pct:.1f}%</b>\n"
         f"🔗 <a href=\"{rec['chart']}\">Chart</a>"
     )
+
+def _sync_tracker_exit(addr: str, outcome: str,
+                        close_price: float, now: float):
+    """
+    Sync tracker_db saat check_exits() menutup posisi.
+
+    Dipanggil dari check_exits() pada:
+    - SL hit (outcome: win_trailing_sl jika profit, loss_sl jika rugi)
+    - TP2 hit (outcome: win_tp2)
+
+    TIDAK dipanggil pada TP1 hit karena posisi belum ditutup.
+    Tanpa fungsi ini, tracker_db tidak tahu posisi sudah ditutup
+    oleh check_exits() dan terus memantau dengan SL/TP lama yang salah.
+    """
+    for rec in tracker_db.get("alerts", []):
+        if rec.get("addr") == addr and rec.get("outcome") == "open":
+            _close_record(rec, outcome, close_price, now)
+            _save_tracker()
+            result = rec.get("result_pct", 0) or 0
+            sign   = "+" if result >= 0 else ""
+            print(f"[TRACKER SYNC] {rec.get('symbol','?')} "
+                  f"→ {outcome} {sign}{result:.1f}%")
+            return
 
 def check_open_alerts():
     """
@@ -563,12 +588,13 @@ def _ks_pnl_text(days: int = 0) -> str:
             f"Belum ada data closed alert."
         )
 
-    wins    = [a for a in closed if a.get("outcome", "").startswith("win")]
-    tp1     = [a for a in closed if a.get("outcome") == "win_tp1"]
-    tp2     = [a for a in closed if a.get("outcome") == "win_tp2"]
-    losses  = [a for a in closed if a.get("outcome") == "loss_sl"]
-    rugs    = [a for a in closed if a.get("outcome") == "rug_suspected"]
-    expired = [a for a in closed if a.get("outcome") == "expired"]
+    wins     = [a for a in closed if a.get("outcome", "").startswith("win")]
+    tp1      = [a for a in closed if a.get("outcome") == "win_tp1"]
+    tp2      = [a for a in closed if a.get("outcome") == "win_tp2"]
+    trailing = [a for a in closed if a.get("outcome") == "win_trailing_sl"]
+    losses   = [a for a in closed if a.get("outcome") == "loss_sl"]
+    rugs     = [a for a in closed if a.get("outcome") == "rug_suspected"]
+    expired  = [a for a in closed if a.get("outcome") == "expired"]
 
     n        = len(closed)
     win_rate = len(wins) / n * 100 if n > 0 else 0
@@ -607,6 +633,7 @@ def _ks_pnl_text(days: int = 0) -> str:
         f"📊 <b>P&amp;L Tracker — {label}</b>\n\n"
         f"<b>Total closed : {n}</b>  |  Open: {open_n}\n"
         f"🎯 TP1: {len(tp1)}  🎯🎯 TP2: {len(tp2)}"
+        f"  ✅ Trail: {len(trailing)}"
         f"  🔴 SL: {len(losses)}  💀 Rug: {len(rugs)}  ⏰ Expired: {len(expired)}\n\n"
         f"{wr_e} Win rate    : <b>{win_rate:.1f}%</b>\n"
         f"{avg_e} Avg result  : <b>{avg_r:+.1f}%</b>\n"
@@ -624,41 +651,42 @@ def _ks_status_text() -> str:
     now        = time.time()
     pause_str  = " | ⏸ PAUSED" if _bot_paused else ""
 
-    # Hitung token yang sedang dipantau (ada di price_tracker)
-    tracked = [
+    # Open dari tracker_db (source of truth untuk P&L)
+    tracker_open = [
+        a for a in tracker_db.get("alerts", [])
+        if a.get("outcome") == "open"
+    ]
+    # Open dari exit engine (price_tracker — yang dipantau SL/TP)
+    engine_open = [
         addr for addr, v in price_tracker.items()
         if isinstance(v, dict) and v.get("entry_sl")
     ]
 
-    # Hitung sinyal yang dikirim hari ini
-    today_start  = time.time() - (time.time() % 86400)
-    today_alerts = sum(
-        1 for ts in alerted_tokens.values()
-        if ts >= today_start
-    )
-
-    # Posisi terbuka dari price_tracker
+    # Posisi terbuka dari exit engine
     pos_lines = ""
     for addr, v in list(price_tracker.items()):
         if not isinstance(v, dict) or not v.get("entry_sl"):
             continue
         sym     = v.get("symbol",       addr[:8])
-        tier    = v.get("tier",         "T?")
+        tier_v  = v.get("tier",         "T?")
         entry_p = v.get("entry_price",  0)
         tp1_hit = v.get("tp1_hit",      False)
         tp2_hit = v.get("tp2_hit",      False)
         status  = "✅TP1" if tp1_hit else ("🟢TP2" if tp2_hit else "⏳open")
-        pos_lines += (f"\n  • <b>{sym}</b> {tier} | "
+        pos_lines += (f"\n  • <b>{sym}</b> {tier_v} | "
                       f"entry ${entry_p:.8f} | {status}")
 
     # P&L ringkas dari tracker
     pnl_section = "\n\n" + _ks_pnl_text(days=0)
 
+    # [DATA-FIX-3] Tampilkan dua sumber secara eksplisit
+    # supaya tidak ada discrepancy yang membingungkan
     return (
         f"Mode: 🔔 Alert-only{pause_str}\n\n"
         f"📡 Sinyal hari ini: <b>{today_alerts}</b>\n"
-        f"👁 Token dipantau: <b>{len(tracked)}</b>\n\n"
-        f"Posisi terbuka ({len(tracked)}):"
+        f"👁 Exit engine: <b>{len(engine_open)}</b> posisi dipantau\n"
+        f"📊 Tracker open: <b>{len(tracker_open)}</b> alert belum closed\n\n"
+        f"Posisi terbuka ({len(engine_open)}):"
         f"{pos_lines if pos_lines else chr(10) + '  (kosong)'}"
         f"{pnl_section}"
     )
@@ -1208,7 +1236,9 @@ def check_hard_reject(gmgn: dict, rugcheck: dict,
     """
     Return (rejected: bool, reason: str).
     Hanya reject jika ada bukti nyata bahaya.
-    Data tidak tersedia BUKAN alasan reject.
+    [DATA-FIX-2] Tambahan: reject token tanpa data safety sama sekali
+    untuk T0/T1 — data 86 alert menunjukkan rug rate 27.9%, banyak
+    dari token yang lulus filter tapi tidak ada data GMGN + Rugcheck.
     """
     # Rugcheck: bahaya terbukti
     if rugcheck.get("available"):
@@ -1222,12 +1252,26 @@ def check_hard_reject(gmgn: dict, rugcheck: dict,
             for rname in rugcheck.get("risks_lower", []):
                 if dangerous in rname:
                     return True, f"🔴 Rugcheck: '{rname}' terdeteksi!"
+        # [DATA-FIX-2] Score Rugcheck sangat rendah = tanda bahaya nyata
+        rc_score = rugcheck.get("score", 0)
+        if rc_score < 40:
+            return True, f"🔴 Rugcheck score terlalu rendah: {rc_score}/100!"
 
     # GMGN: bahaya terbukti
     if gmgn.get("is_honeypot"):
         return True, "🔴 HONEYPOT!"
     if gmgn.get("rug_ratio", 0) > 0.8:
         return True, "🔴 RUG RATIO TINGGI!"
+
+    # [DATA-FIX-2] Tidak ada data safety sama sekali = terlalu berisiko
+    # Rug rate 27.9% di data nyata — banyak dari token tanpa data apapun
+    gmgn_ok     = gmgn.get("available", False)
+    rugcheck_ok = rugcheck.get("available", False)
+    if not gmgn_ok and not rugcheck_ok:
+        if tier == "T0":
+            return True, "🔴 T0 tanpa data GMGN + Rugcheck — rug risk terlalu tinggi!"
+        elif tier == "T1":
+            return True, "🔴 T1 tanpa data GMGN + Rugcheck — tidak bisa verifikasi keamanan!"
 
     # Helius: konsentrasi ekstrem
     if helius.get("available"):
@@ -1237,8 +1281,7 @@ def check_hard_reject(gmgn: dict, rugcheck: dict,
         if helius.get("hub_spoke"):
             if tier in ("T1", "T2", "T3"):
                 return True, "🔴 Hub & Spoke pada token established!"
-            # [V11-5] T0: reject jika holders sedikit (distribusi sangat berisiko)
-            # v10 hanya -5 score untuk T0 — terlalu lunak untuk tier paling berisiko
+            # [V11-5] T0: reject jika holders sedikit
             if tier == "T0":
                 holders = gmgn.get("holders", 0) if gmgn.get("available") else 0
                 if holders < 50:
@@ -1795,24 +1838,22 @@ def analyze_pair(pair: dict) -> dict | None:
         if len(red_w) >= 2:
             return None
 
-        # ── GRADE (hanya A+, A, B) ─────────────────────
+        # ── GRADE — hanya A+ dan A, Grade B dihapus ──────
+        # [DATA-FIX-1] Grade B win rate terlalu rendah di data nyata.
+        # Lebih sedikit alert tapi kualitas lebih tinggi.
         if tier == "T0":
             if   total >= 15: grade, status = "A",  "🔥 PRE-PUMP! Entry ultra early!"
-            elif total >= 10: grade, status = "B",  "🟡 Sinyal awal ada"
             else: return None
         elif tier == "T1":
             if   total >= 20: grade, status = "A",  "🟢 Setup bagus — EARLY!"
-            elif total >= 13: grade, status = "B",  "🟡 Setup cukup"
             else: return None
         elif tier == "T2":
             if   total >= 24: grade, status = "A+", "💎 Setup premium!"
             elif total >= 18: grade, status = "A",  "🟢 Setup sangat bagus!"
-            elif total >= 12: grade, status = "B",  "🟡 Setup cukup"
             else: return None
         else:  # T3
             if   total >= 26: grade, status = "A+", "💎 Setup premium!"
             elif total >= 20: grade, status = "A",  "🟢 Setup bagus"
-            elif total >= 13: grade, status = "B",  "🟡 Setup cukup"
             else: return None
 
         pos_map = {"T0": T0_MAX_POSITION, "T1": T1_MAX_POSITION,
@@ -2111,6 +2152,9 @@ def check_exits():
                 f"🔴 SL: <b>${sl:.8f}</b>\n"
                 f"📉 P&amp;L: <b>{pct:+.1f}%</b>\n\n"
                 f"⚠️ Keluar posisi sekarang!")
+            # Sync tracker: trailing SL dengan profit = win, SL biasa = loss
+            outcome_sl = "win_trailing_sl" if pct > 0 else "loss_sl"
+            _sync_tracker_exit(addr, outcome_sl, price_now, now)
             to_close.append(addr)
             continue
 
@@ -2125,11 +2169,13 @@ def check_exits():
                 f"🎯 TP2: <b>${tp2:.8f}</b>\n"
                 f"📈 P&amp;L: <b>+{pct:.1f}%</b> 🎉\n\n"
                 f"✅ Jual SEMUA sisa posisi!")
+            # Sync tracker: TP2 hit = win_tp2
+            _sync_tracker_exit(addr, "win_tp2", price_now, now)
             price_tracker[addr]["tp2_hit"] = True
             to_close.append(addr)
             continue
 
-        # Cek TP1 kena (hanya sekali)
+        # Cek TP1 kena (hanya sekali) — posisi TIDAK ditutup, tidak sync tracker
         if price_now >= tp1 and not entry.get("tp1_hit"):
             pct = (price_now / entry_price - 1) * 100 if entry_price > 0 else 0
             print(f"[TP1 HIT] {sym} ${price_now:.8f} ≥ TP1 ${tp1:.8f}")
@@ -2142,6 +2188,7 @@ def check_exits():
                 f"💡 Jual <b>50%</b> posisi sekarang!\n"
                 f"🟢 Biarkan 50% sisanya jalan ke TP2: <b>${tp2:.8f}</b>")
             price_tracker[addr]["tp1_hit"] = True
+            # Tracker TIDAK di-sync di sini — posisi masih terbuka 50%
 
     # Hapus token yang sudah ditutup dari tracker
     for addr in to_close:
@@ -2296,18 +2343,18 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        "🤖 <b>DIP &amp; RIP Bot v11.1 aktif!</b>\n\n"
-        "🔧 <b>Fix dari analisis log:</b>\n"
-        "✅ [LOG-1] Hard reject cache — token berbahaya\n"
-        "   di-skip 60 menit tanpa API call\n"
-        "✅ [LOG-2] Tracker aktif — record + outcome\n"
-        "   (silent, tidak duplikat exit alert)\n\n"
-        "🏗️ <b>Arsitektur 7 gate + Exit Engine:</b>\n"
+        "🤖 <b>DIP &amp; RIP Bot v11.3 aktif!</b>\n\n"
+        "📊 <b>Data-driven fixes (86 closed alert):</b>\n"
+        "✅ Grade B dihapus — hanya A dan A+\n"
+        "✅ Hard reject: no-data T0/T1 = skip\n"
+        "✅ Rugcheck &lt; 40 = hard reject\n"
+        "✅ /status open count lebih jelas\n\n"
+        "🏗️ <b>Arsitektur 7 gate + Exit Engine + Tracker:</b>\n"
         "G1 Basic → G2 Pattern → G3 F1/F2\n"
         "→ G4 API → G5 Hard reject\n"
         "→ G6 Score → G7 Alert\n"
-        "→ Exit Engine (TP1/TP2/SL/Trailing)\n\n"
-        "🎮 <b>Kill switch:</b> /status /balance /pause /resume /stop /help\n\n"
+        "→ Exit Engine + Tracker Sync\n\n"
+        "🎮 /status /pnl /pnl 7 /balance /pause /resume /help\n"
         "🚨 Scan setiap 30 detik!"
     )
 
